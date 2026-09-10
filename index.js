@@ -13,10 +13,11 @@ if (!process.env.ADMIN_KEY) {
 }
 
 app.use(express.json());
+app.use(express.static('public'));
 
-// Admin routes — protected by ADMIN_KEY header
+// Admin routes — protected by ADMIN_KEY header or ?key= query param
 app.use('/admin', (req, res, next) => {
-  const key = req.headers['x-admin-key'];
+  const key = req.headers['x-admin-key'] || req.query.key;
   if (key !== process.env.ADMIN_KEY) {
     return res.status(401).json({ error: 'Invalid admin key' });
   }

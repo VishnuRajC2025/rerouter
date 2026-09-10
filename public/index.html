@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rerouter Admin</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f0f; color: #e0e0e0; min-height: 100vh; }
+  header { background: #1a1a1a; border-bottom: 1px solid #2a2a2a; padding: 16px 32px; display: flex; align-items: center; justify-content: space-between; }
+  header h1 { font-size: 18px; font-weight: 600; color: #fff; }
+  .admin-key-bar { display: flex; align-items: center; gap: 10px; }
+  .admin-key-bar label { font-size: 13px; color: #888; }
+  .admin-key-bar input { background: #2a2a2a; border: 1px solid #3a3a3a; color: #fff; padding: 6px 12px; border-radius: 6px; font-size: 13px; width: 220px; }
+  .admin-key-bar input:focus { outline: none; border-color: #6366f1; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #888; display: inline-block; }
+  .status-dot.ok { background: #22c55e; }
+  .status-dot.err { background: #ef4444; }
+
+  main { max-width: 1100px; margin: 0 auto; padding: 32px; }
+
+  .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; padding: 24px; margin-bottom: 24px; }
+  .card h2 { font-size: 15px; font-weight: 600; color: #fff; margin-bottom: 20px; }
+
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 14px; }
+  .field label { display: block; font-size: 12px; color: #888; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .field input { width: 100%; background: #2a2a2a; border: 1px solid #3a3a3a; color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 13px; }
+  .field input:focus { outline: none; border-color: #6366f1; }
+  .field input::placeholder { color: #555; }
+
+  .btn { padding: 9px 18px; border-radius: 6px; border: none; cursor: pointer; font-size: 13px; font-weight: 500; transition: opacity 0.15s; }
+  .btn:hover { opacity: 0.85; }
+  .btn-primary { background: #6366f1; color: #fff; }
+  .btn-sm { padding: 5px 12px; font-size: 12px; }
+  .btn-danger { background: #3f1010; color: #f87171; border: 1px solid #7f1d1d; }
+  .btn-warning { background: #3f2e00; color: #fbbf24; border: 1px solid #78350f; }
+  .btn-success { background: #052e16; color: #4ade80; border: 1px solid #14532d; }
+  .btn-neutral { background: #2a2a2a; color: #aaa; border: 1px solid #3a3a3a; }
+  .btn-download { background: #1e3a5f; color: #60a5fa; border: 1px solid #1d4ed8; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 10px 12px; color: #666; font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #2a2a2a; }
+  td { padding: 12px; border-bottom: 1px solid #1f1f1f; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #1f1f1f; }
+
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; }
+  .badge-active { background: #052e16; color: #4ade80; }
+  .badge-disabled { background: #2a1010; color: #f87171; }
+  .badge-expired { background: #1c1c00; color: #facc15; }
+
+  .token-cell { font-family: monospace; font-size: 12px; color: #a78bfa; cursor: pointer; }
+  .token-cell:hover { color: #c4b5fd; }
+
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+  .usage-bar { height: 4px; background: #2a2a2a; border-radius: 2px; margin-top: 4px; min-width: 80px; }
+  .usage-bar-fill { height: 100%; border-radius: 2px; background: #6366f1; transition: width 0.3s; }
+  .usage-bar-fill.warn { background: #f59e0b; }
+  .usage-bar-fill.danger { background: #ef4444; }
+
+  .empty { text-align: center; color: #555; padding: 40px; font-size: 14px; }
+
+  .toast { position: fixed; bottom: 24px; right: 24px; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 12px 18px; font-size: 13px; color: #fff; z-index: 999; opacity: 0; transition: opacity 0.2s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .toast.ok { border-color: #14532d; color: #4ade80; }
+  .toast.err { border-color: #7f1d1d; color: #f87171; }
+
+  .create-row { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; }
+  .create-row .form-grid { flex: 1; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Rerouter Admin</h1>
+  <div class="admin-key-bar">
+    <span class="status-dot" id="statusDot"></span>
+    <label>Admin Key</label>
+    <input type="password" id="adminKey" placeholder="Enter your ADMIN_KEY" oninput="onKeyInput()">
+  </div>
+</header>
+
+<main>
+  <div class="card">
+    <h2>Create Token</h2>
+    <div class="create-row">
+      <div class="form-grid">
+        <div class="field">
+          <label>Customer Name</label>
+          <input type="text" id="cName" placeholder="e.g. John">
+        </div>
+        <div class="field">
+          <label>Expires In (days)</label>
+          <input type="number" id="cDays" placeholder="e.g. 30" min="1">
+        </div>
+        <div class="field">
+          <label>Token Limit / Window</label>
+          <input type="number" id="cTokenLimit" placeholder="e.g. 100000" min="1">
+        </div>
+        <div class="field">
+          <label>Window (hours)</label>
+          <input type="number" id="cWindowHours" placeholder="e.g. 5" min="1">
+        </div>
+        <div class="field">
+          <label>Request Limit / Window</label>
+          <input type="number" id="cReqLimit" placeholder="optional" min="1">
+        </div>
+      </div>
+      <button class="btn btn-primary" onclick="createToken()">Create Token</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Tokens <span id="tokenCount" style="color:#555;font-weight:400;font-size:13px;"></span></h2>
+    <div id="tokenTable"><div class="empty">Enter your admin key above to load tokens.</div></div>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const BASE = window.location.origin;
+let adminKey = '';
+
+function onKeyInput() {
+  adminKey = document.getElementById('adminKey').value;
+  if (adminKey.length > 3) loadTokens();
+}
+
+async function api(method, path, body) {
+  const res = await fetch(BASE + path, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'x-admin-key': adminKey },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, data };
+}
+
+function toast(msg, type = 'ok') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show ' + type;
+  setTimeout(() => el.className = 'toast', 2500);
+}
+
+function setStatus(ok) {
+  document.getElementById('statusDot').className = 'status-dot ' + (ok ? 'ok' : 'err');
+}
+
+async function loadTokens() {
+  const { ok, data } = await api('GET', '/admin/tokens');
+  setStatus(ok);
+  if (!ok) {
+    document.getElementById('tokenTable').innerHTML = '<div class="empty">Invalid admin key or server error.</div>';
+    document.getElementById('tokenCount').textContent = '';
+    return;
+  }
+  const tokens = data;
+  document.getElementById('tokenCount').textContent = `(${tokens.length})`;
+  if (!tokens.length) {
+    document.getElementById('tokenTable').innerHTML = '<div class="empty">No tokens yet. Create one above.</div>';
+    return;
+  }
+  document.getElementById('tokenTable').innerHTML = renderTable(tokens);
+}
+
+function renderTable(tokens) {
+  return `<table>
+    <thead><tr>
+      <th>Name</th><th>Token</th><th>Status</th>
+      <th>Token Usage</th><th>Requests</th>
+      <th>Window</th><th>Expires</th><th>Actions</th>
+    </tr></thead>
+    <tbody>${tokens.map(renderRow).join('')}</tbody>
+  </table>`;
+}
+
+function renderRow(t) {
+  const now = new Date();
+  const expired = t.expires_at && new Date(t.expires_at) < now;
+  const status = expired ? 'expired' : (t.enabled ? 'active' : 'disabled');
+  const badgeClass = { active: 'badge-active', disabled: 'badge-disabled', expired: 'badge-expired' }[status];
+
+  const tokenUsagePct = t.token_limit ? Math.min(100, Math.round(t.tokens_used / t.token_limit * 100)) : null;
+  const reqUsagePct = t.request_limit ? Math.min(100, Math.round(t.requests_used / t.request_limit * 100)) : null;
+
+  const barColor = (pct) => pct >= 90 ? 'danger' : pct >= 70 ? 'warn' : '';
+
+  const tokenUsageHtml = t.token_limit
+    ? `${t.tokens_used.toLocaleString()} / ${t.token_limit.toLocaleString()}
+       <div class="usage-bar"><div class="usage-bar-fill ${barColor(tokenUsagePct)}" style="width:${tokenUsagePct}%"></div></div>`
+    : `${t.tokens_used.toLocaleString()} <span style="color:#555">/ ∞</span>`;
+
+  const reqUsageHtml = t.request_limit
+    ? `${t.requests_used} / ${t.request_limit}
+       <div class="usage-bar"><div class="usage-bar-fill ${barColor(reqUsagePct)}" style="width:${reqUsagePct}%"></div></div>`
+    : `${t.requests_used} <span style="color:#555">/ ∞</span>`;
+
+  const expires = t.expires_at ? new Date(t.expires_at).toLocaleDateString() : '—';
+  const window = t.reset_interval_hours ? `every ${t.reset_interval_hours}h` : '—';
+
+  const toggleBtn = t.enabled
+    ? `<button class="btn btn-sm btn-warning" onclick="toggleToken('${t.id}', false)">Disable</button>`
+    : `<button class="btn btn-sm btn-success" onclick="toggleToken('${t.id}', true)">Enable</button>`;
+
+  return `<tr>
+    <td><strong>${esc(t.name)}</strong></td>
+    <td><span class="token-cell" onclick="copyToken('${esc(t.token)}')" title="Click to copy">${t.token.slice(0,18)}…</span></td>
+    <td><span class="badge ${badgeClass}">${status}</span></td>
+    <td>${tokenUsageHtml}</td>
+    <td>${reqUsageHtml}</td>
+    <td style="color:#888">${window}</td>
+    <td style="color:#888">${expires}</td>
+    <td>
+      <div class="actions">
+        <button class="btn btn-sm btn-download" onclick="downloadScript('${t.id}', '${esc(t.name)}')">Script</button>
+        ${toggleBtn}
+        <button class="btn btn-sm btn-danger" onclick="deleteToken('${t.id}', '${esc(t.name)}')">Delete</button>
+      </div>
+    </td>
+  </tr>`;
+}
+
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function createToken() {
+  const name = document.getElementById('cName').value.trim();
+  const days = parseInt(document.getElementById('cDays').value) || null;
+  const tokenLimit = parseInt(document.getElementById('cTokenLimit').value) || null;
+  const windowHours = parseInt(document.getElementById('cWindowHours').value) || null;
+  const reqLimit = parseInt(document.getElementById('cReqLimit').value) || null;
+
+  if (!name) { toast('Enter a customer name', 'err'); return; }
+
+  const body = { name };
+  if (days) body.expires_in_days = days;
+  if (tokenLimit) body.token_limit = tokenLimit;
+  if (windowHours) body.reset_interval_hours = windowHours;
+  if (reqLimit) body.request_limit = reqLimit;
+
+  const { ok, data } = await api('POST', '/admin/tokens', body);
+  if (!ok) { toast(data.error || 'Failed to create token', 'err'); return; }
+  toast(`Token created for ${name}`);
+  ['cName','cDays','cTokenLimit','cWindowHours','cReqLimit'].forEach(id => document.getElementById(id).value = '');
+  loadTokens();
+}
+
+async function toggleToken(id, enable) {
+  const path = `/admin/tokens/${id}/${enable ? 'enable' : 'disable'}`;
+  const { ok } = await api('POST', path);
+  if (!ok) { toast('Failed', 'err'); return; }
+  toast(enable ? 'Token enabled' : 'Token disabled');
+  loadTokens();
+}
+
+async function deleteToken(id, name) {
+  if (!confirm(`Delete token for "${name}"? This cannot be undone.`)) return;
+  const { ok } = await api('DELETE', `/admin/tokens/${id}`);
+  if (!ok) { toast('Failed to delete', 'err'); return; }
+  toast(`Deleted ${name}`);
+  loadTokens();
+}
+
+function downloadScript(id, name) {
+  const a = document.createElement('a');
+  a.href = `${BASE}/admin/tokens/${id}/script?key=${encodeURIComponent(adminKey)}`;
+  a.download = `setup-${name}.bat`;
+  a.click();
+}
+
+function copyToken(token) {
+  navigator.clipboard.writeText(token).then(() => toast('Token copied to clipboard'));
+}
+
+// Auto-load if key is pre-filled (e.g. browser saved)
+window.addEventListener('load', () => {
+  const saved = localStorage.getItem('adminKey');
+  if (saved) { document.getElementById('adminKey').value = saved; adminKey = saved; loadTokens(); }
+});
+document.getElementById('adminKey').addEventListener('change', () => {
+  localStorage.setItem('adminKey', adminKey);
+});
+</script>
+</body>
+</html>
