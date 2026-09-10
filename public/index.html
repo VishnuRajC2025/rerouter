@@ -66,6 +66,13 @@
   .toast.ok { border-color: #14532d; color: #4ade80; }
   .toast.err { border-color: #7f1d1d; color: #f87171; }
 
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; display: flex; align-items: center; justify-content: center; }
+  .modal-overlay.hidden { display: none; }
+  .modal { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; padding: 24px; width: 600px; max-width: 95vw; }
+  .modal h3 { font-size: 15px; font-weight: 600; color: #fff; margin-bottom: 16px; }
+  .modal pre { background: #0f0f0f; border: 1px solid #2a2a2a; border-radius: 8px; padding: 16px; font-size: 12px; color: #a78bfa; overflow-x: auto; white-space: pre-wrap; word-break: break-all; margin-bottom: 16px; max-height: 300px; overflow-y: auto; }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+
   .create-row { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; }
   .create-row .form-grid { flex: 1; }
 </style>
@@ -118,6 +125,17 @@
 </main>
 
 <div class="toast" id="toast"></div>
+
+<div class="modal-overlay hidden" id="scriptModal" onclick="closeModal(event)">
+  <div class="modal">
+    <h3 id="modalTitle">Setup Script</h3>
+    <pre id="modalScript"></pre>
+    <div class="modal-actions">
+      <button class="btn btn-neutral" onclick="document.getElementById('scriptModal').classList.add('hidden')">Close</button>
+      <button class="btn btn-primary" onclick="copyScript()">Copy to Clipboard</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const BASE = window.location.origin;
@@ -263,11 +281,22 @@ async function deleteToken(id, name) {
   loadTokens();
 }
 
-function downloadScript(id, name) {
-  const a = document.createElement('a');
-  a.href = `${BASE}/admin/tokens/${id}/script?key=${encodeURIComponent(adminKey)}`;
-  a.download = `setup-${name}.bat`;
-  a.click();
+async function downloadScript(id, name) {
+  const res = await fetch(`${BASE}/admin/tokens/${id}/script?key=${encodeURIComponent(adminKey)}`);
+  if (!res.ok) { toast('Failed to load script', 'err'); return; }
+  const text = await res.text();
+  document.getElementById('modalTitle').textContent = `Setup Script — ${name}`;
+  document.getElementById('modalScript').textContent = text;
+  document.getElementById('scriptModal').classList.remove('hidden');
+}
+
+function copyScript() {
+  const text = document.getElementById('modalScript').textContent;
+  navigator.clipboard.writeText(text).then(() => toast('Script copied to clipboard'));
+}
+
+function closeModal(e) {
+  if (e.target.id === 'scriptModal') document.getElementById('scriptModal').classList.add('hidden');
 }
 
 function copyToken(token) {
