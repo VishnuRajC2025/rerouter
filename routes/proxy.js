@@ -62,6 +62,7 @@ router.use(async (req, res) => {
   const forwardHeaders = {
     'content-type': req.headers['content-type'] || 'application/json',
     'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
+    'x-api-key': process.env.ANTHROPIC_AUTH_TOKEN,
     'authorization': `Bearer ${process.env.ANTHROPIC_AUTH_TOKEN}`,
   };
   if (req.headers['anthropic-beta']) {
