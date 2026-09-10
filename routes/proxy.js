@@ -53,7 +53,7 @@ function validateToken(raw) {
 }
 
 // Forward any path under /v1 to Anthropic
-router.all('/*', async (req, res) => {
+router.use(async (req, res) => {
   const raw = extractToken(req);
   const { error, status, row } = validateToken(raw);
   if (error) return res.status(status).json({ error });
