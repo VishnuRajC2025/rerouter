@@ -95,32 +95,38 @@ router.use(async (req, res) => {
 
       let inputTokens = 0;
       let outputTokens = 0;
-      const chunks = [];
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
 
-      upstream.body.on('data', (chunk) => {
-        res.write(chunk);
-        chunks.push(chunk.toString());
-      });
-
-      upstream.body.on('end', () => {
-        res.end();
-        for (const chunk of chunks) {
-          for (const line of chunk.split('\n')) {
-            if (line.startsWith('data: ') && !line.includes('[DONE]')) {
-              try {
-                const data = JSON.parse(line.slice(6));
-                if (data.type === 'message_start' && data.message?.usage) {
-                  inputTokens += data.message.usage.input_tokens || 0;
-                }
-                if (data.type === 'message_delta' && data.usage) {
-                  outputTokens += data.usage.output_tokens || 0;
-                }
-              } catch (_) {}
+      const pump = async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = decoder.decode(value, { stream: true });
+            res.write(chunk);
+            for (const line of chunk.split('\n')) {
+              if (line.startsWith('data: ') && !line.includes('[DONE]')) {
+                try {
+                  const data = JSON.parse(line.slice(6));
+                  if (data.type === 'message_start' && data.message?.usage) {
+                    inputTokens += data.message.usage.input_tokens || 0;
+                  }
+                  if (data.type === 'message_delta' && data.usage) {
+                    outputTokens += data.usage.output_tokens || 0;
+                  }
+                } catch (_) {}
+              }
             }
           }
+          res.end();
+          logUsage(row.id, req.body?.model, inputTokens, outputTokens);
+        } catch (err) {
+          console.error('Stream error:', err);
+          res.end();
         }
-        logUsage(row.id, req.body?.model, inputTokens, outputTokens);
-      });
+      };
+      pump();
     } else {
       const data = await upstream.json();
       res.status(upstream.status).json(data);
