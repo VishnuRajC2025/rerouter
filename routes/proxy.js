@@ -405,8 +405,22 @@ router.use(async (req, res) => {
           logUsage(row.id, claudeModel, state.finalInputTokens || 0, state.finalOutputTokens || 0);
         } catch (err) {
           clearInterval(keepAlive);
-          console.error('Stream error:', err);
-          res.end();
+          console.error('Stream error:', err.message);
+          // Send a clean message_stop so Claude Code doesn't hang
+          if (!res.writableEnded) {
+            if (!state.started) {
+              // Nothing sent yet — send minimal valid Anthropic error response
+              res.write(`event: message_start\ndata: ${JSON.stringify({ type:'message_start', message:{ id:`msg_${Date.now()}`, type:'message', role:'assistant', model:claudeModel, content:[], stop_reason:null, usage:{input_tokens:0,output_tokens:0} } })}\n\n`);
+              res.write(`event: content_block_start\ndata: ${JSON.stringify({ type:'content_block_start', index:0, content_block:{type:'text',text:''} })}\n\n`);
+              res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type:'content_block_delta', index:0, delta:{type:'text_delta', text:'[Connection dropped. Please resend your message.]'} })}\n\n`);
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type:'content_block_stop', index:0 })}\n\n`);
+            } else if (state.blockOpen) {
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type:'content_block_stop', index:state.blockIndex })}\n\n`);
+            }
+            res.write(`event: message_delta\ndata: ${JSON.stringify({ type:'message_delta', delta:{stop_reason:'end_turn'}, usage:{output_tokens:state.outputTokens||0} })}\n\n`);
+            res.write(`event: message_stop\ndata: ${JSON.stringify({ type:'message_stop' })}\n\n`);
+            res.end();
+          }
         }
       };
       pump();
