@@ -304,6 +304,11 @@ router.use(async (req, res) => {
   const { error, status, row } = validateToken(raw);
   if (error) return res.status(status).json({ error });
 
+  // Log request size to diagnose 32MB issue
+  const bodyStr = JSON.stringify(req.body);
+  const bodyBytes = Buffer.byteLength(bodyStr, 'utf8');
+  console.log(`[${req.path}] model=${req.body?.model} msgs=${req.body?.messages?.length} tools=${req.body?.tools?.length || 0} bodySize=${(bodyBytes/1024).toFixed(1)}KB`);
+
   // Models list — return fake Claude model list
   if (req.path === '/models' || req.path === '/models/') {
     return res.json({
