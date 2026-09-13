@@ -1,3 +1,5 @@
 node_modules/
 .env
 rerouter.db
+rerouter.db
+.env
