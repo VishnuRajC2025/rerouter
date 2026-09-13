@@ -367,6 +367,10 @@ router.use(async (req, res) => {
       res.setHeader('connection', 'keep-alive');
       res.status(200);
 
+      // Send keep-alive pings every 5s so Claude Code doesn't time out
+      // while the model is thinking before its first token
+      const keepAlive = setInterval(() => res.write(': ping\n\n'), 5000);
+
       const reader = upstream.body.getReader();
       const decoder = new TextDecoder();
       const state = { claudeModel, started: false };
@@ -391,9 +395,11 @@ router.use(async (req, res) => {
               }
             }
           }
+          clearInterval(keepAlive);
           res.end();
           logUsage(row.id, claudeModel, state.finalInputTokens || 0, state.finalOutputTokens || 0);
         } catch (err) {
+          clearInterval(keepAlive);
           console.error('Stream error:', err);
           res.end();
         }
