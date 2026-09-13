@@ -4,7 +4,52 @@ const db = require('../db');
 const router = express.Router();
 
 const FREE_BASE = (process.env.FREE_BACKEND_URL || 'https://api.groq.com/openai/v1').replace(/\/$/, '');
-const getKey = () => process.env.FREE_BACKEND_KEY || '';
+
+// Auto-refreshing token manager for Open WebUI
+const tokenCache = {
+  token: process.env.FREE_BACKEND_KEY || '',
+  expiresAt: 0,
+};
+
+// Parse JWT expiry without a library
+function jwtExpiry(token) {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+    return (payload.exp || 0) * 1000;
+  } catch (_) { return 0; }
+}
+
+async function getKey() {
+  const email = process.env.WEBUI_EMAIL;
+  const password = process.env.WEBUI_PASSWORD;
+  const loginUrl = process.env.WEBUI_LOGIN_URL || (FREE_BASE.replace(/\/api.*$/, '') + '/api/v1/auths/signin');
+
+  // If no auto-refresh creds, just return static key
+  if (!email || !password) return process.env.FREE_BACKEND_KEY || '';
+
+  // Refresh if token expires within 1 hour
+  const now = Date.now();
+  if (tokenCache.token && tokenCache.expiresAt > now + 3600_000) {
+    return tokenCache.token;
+  }
+
+  try {
+    const resp = await fetch(loginUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    if (!resp.ok) throw new Error(`Login failed: ${resp.status}`);
+    const data = await resp.json();
+    tokenCache.token = data.token;
+    tokenCache.expiresAt = jwtExpiry(data.token) || (now + 25 * 24 * 3600_000);
+    console.log('Token refreshed, expires:', new Date(tokenCache.expiresAt).toISOString());
+    return tokenCache.token;
+  } catch (err) {
+    console.error('Token refresh failed:', err.message);
+    return tokenCache.token; // fall back to cached
+  }
+}
 
 // Map Claude model names → backend model
 function mapModel(claudeModel) {
@@ -300,7 +345,7 @@ router.use(async (req, res) => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'authorization': `Bearer ${getKey()}`,
+        'authorization': `Bearer ${await getKey()}`,
       },
       body: JSON.stringify(openAIBody),
     });
