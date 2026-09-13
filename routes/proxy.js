@@ -333,9 +333,21 @@ router.use(async (req, res) => {
   const claudeModel = body.model || 'claude-opus-4-5';
   const isStream = body.stream === true;
 
+  // Auto-truncate: keep last 40 messages when conversation gets too large
+  const MAX_MSGS = 40;
+  let msgs = body.messages || [];
+  if (msgs.length > MAX_MSGS) {
+    const kept = msgs.slice(-MAX_MSGS);
+    // Inject a note so the model knows context was trimmed
+    kept.unshift({ role: 'user', content: '[Note: Earlier conversation history was auto-truncated to keep context manageable.]' });
+    kept.splice(1, 0, { role: 'assistant', content: 'Understood. I\'ll continue from the recent context.' });
+    msgs = kept;
+    console.log(`Auto-truncated: ${body.messages.length} → ${msgs.length} messages`);
+  }
+
   const openAIBody = {
     model: mapModel(claudeModel),
-    messages: toOpenAIMessages(body.system, body.messages || []),
+    messages: toOpenAIMessages(body.system, msgs),
     max_tokens: body.max_tokens || 4096,
     stream: isStream,
   };
