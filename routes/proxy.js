@@ -6,12 +6,14 @@ const router = express.Router();
 const FREE_BASE = (process.env.FREE_BACKEND_URL || 'https://api.groq.com/openai/v1').replace(/\/$/, '');
 const getKey = () => process.env.FREE_BACKEND_KEY || '';
 
-// Map Claude model names → free backend model
+// Map Claude model names → backend model
 function mapModel(claudeModel) {
-  if (!claudeModel) return 'openai/gpt-oss-120b';
+  if (!claudeModel) return 'claude-opus-5';
   const m = claudeModel.toLowerCase();
-  if (m.includes('haiku')) return 'openai/gpt-oss-20b';
-  return 'openai/gpt-oss-120b';
+  if (m.includes('haiku')) return 'claude-fable-5';
+  if (m.includes('fable')) return 'claude-fable-5';
+  if (m.includes('sonnet')) return 'claude-sonnet-5';
+  return 'claude-opus-5';
 }
 
 function extractToken(req) {
