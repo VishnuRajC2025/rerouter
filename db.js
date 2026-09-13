@@ -2,7 +2,11 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 
-const dbPath = process.env.DB_PATH || path.join(__dirname, 'rerouter.db');
+// On Railway, always use the mounted volume. Ignore DB_PATH env var if it looks like a Windows path.
+const rawDbPath = process.env.DB_PATH || '';
+const dbPath = (process.env.RAILWAY_ENVIRONMENT && (!rawDbPath || rawDbPath.includes(':')))
+  ? '/data/rerouter.db'
+  : (rawDbPath || path.join(__dirname, 'rerouter.db'));
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 const db = new Database(dbPath);
 
