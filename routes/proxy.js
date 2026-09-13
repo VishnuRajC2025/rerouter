@@ -358,14 +358,23 @@ router.use(async (req, res) => {
   if (isStream) openAIBody.stream_options = { include_usage: true };
 
   try {
-    const upstream = await fetch(`${FREE_BASE}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'authorization': `Bearer ${await getKey()}`,
-      },
-      body: JSON.stringify(openAIBody),
-    });
+    const controller = new AbortController();
+    const upstreamTimeout = setTimeout(() => controller.abort(), 90_000);
+
+    let upstream;
+    try {
+      upstream = await fetch(`${FREE_BASE}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'authorization': `Bearer ${await getKey()}`,
+        },
+        body: JSON.stringify(openAIBody),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(upstreamTimeout);
+    }
 
     db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id);
 
@@ -396,7 +405,11 @@ router.use(async (req, res) => {
       const pump = async () => {
         try {
           while (true) {
-            const { done, value } = await reader.read();
+            // 60s timeout per chunk — abort if upstream stalls mid-stream
+            const readTimeout = new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('Upstream stalled')), 60_000)
+            );
+            const { done, value } = await Promise.race([reader.read(), readTimeout]);
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split('\n');
