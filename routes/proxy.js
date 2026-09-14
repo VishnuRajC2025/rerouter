@@ -96,12 +96,18 @@ function validateToken(raw) {
   return { row };
 }
 
+const TOOL_RESULT_LIMIT = 2000; // chars — old tool results beyond last 10 msgs get capped
+const RECENT_MSGS = 10;         // keep last N messages' tool results fully intact
+
 // Convert Anthropic messages + system → OpenAI messages
 function toOpenAIMessages(system, messages) {
   const result = [];
   if (system) result.push({ role: 'system', content: system });
 
-  for (const msg of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    const isRecent = i >= messages.length - RECENT_MSGS;
+
     if (typeof msg.content === 'string') {
       result.push({ role: msg.role, content: msg.content });
       continue;
@@ -117,9 +123,13 @@ function toOpenAIMessages(system, messages) {
 
     if (toolResultBlocks.length > 0) {
       for (const block of toolResultBlocks) {
-        const content = typeof block.content === 'string'
+        let content = typeof block.content === 'string'
           ? block.content
           : (Array.isArray(block.content) ? block.content.map(b => b.text || '').join('') : '');
+        // Truncate old tool results to reduce token usage
+        if (!isRecent && content.length > TOOL_RESULT_LIMIT) {
+          content = content.slice(0, TOOL_RESULT_LIMIT) + '\n[...truncated]';
+        }
         result.push({ role: 'tool', tool_call_id: block.tool_use_id, content });
       }
       if (textBlocks.length > 0) {
@@ -337,8 +347,11 @@ router.use(async (req, res) => {
   const MAX_MSGS = 40;
   let msgs = body.messages || [];
   if (msgs.length > MAX_MSGS) {
-    const kept = msgs.slice(-MAX_MSGS);
-    // Inject a note so the model knows context was trimmed
+    let kept = msgs.slice(-MAX_MSGS);
+    // Ensure slice starts at a user message — orphaned tool/assistant messages
+    // at the start cause OpenAI to reject the request with an invalid sequence error
+    while (kept.length > 0 && kept[0].role !== 'user') kept.shift();
+    if (kept.length === 0) kept = msgs.slice(-2); // fallback: keep last 2
     kept.unshift({ role: 'user', content: '[Note: Earlier conversation history was auto-truncated to keep context manageable.]' });
     kept.splice(1, 0, { role: 'assistant', content: 'Understood. I\'ll continue from the recent context.' });
     msgs = kept;
@@ -358,23 +371,14 @@ router.use(async (req, res) => {
   if (isStream) openAIBody.stream_options = { include_usage: true };
 
   try {
-    const controller = new AbortController();
-    const upstreamTimeout = setTimeout(() => controller.abort(), 90_000);
-
-    let upstream;
-    try {
-      upstream = await fetch(`${FREE_BASE}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'authorization': `Bearer ${await getKey()}`,
-        },
-        body: JSON.stringify(openAIBody),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(upstreamTimeout);
-    }
+    const upstream = await fetch(`${FREE_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${await getKey()}`,
+      },
+      body: JSON.stringify(openAIBody),
+    });
 
     db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id);
 
@@ -405,11 +409,7 @@ router.use(async (req, res) => {
       const pump = async () => {
         try {
           while (true) {
-            // 60s timeout per chunk — abort if upstream stalls mid-stream
-            const readTimeout = new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('Upstream stalled')), 60_000)
-            );
-            const { done, value } = await Promise.race([reader.read(), readTimeout]);
+            const { done, value } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split('\n');
