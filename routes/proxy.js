@@ -184,7 +184,7 @@ function toAnthropicResponse(data, claudeModel) {
   const stopReason = fr === 'tool_calls' ? 'tool_use' : fr === 'length' ? 'max_tokens' : 'end_turn';
 
   return {
-    id: data.id || `msg_${Date.now()}`,
+    id: `msg_${Date.now()}`,
     type: 'message',
     role: 'assistant',
     model: claudeModel,
@@ -200,6 +200,12 @@ function toAnthropicResponse(data, claudeModel) {
 
 // Convert OpenAI SSE chunk → Anthropic SSE events (generator)
 function* toAnthropicEvents(chunk, state) {
+  // OpenAI sends a final usage-only chunk with empty choices — capture tokens, emit nothing
+  if (chunk.usage && (!chunk.choices || chunk.choices.length === 0)) {
+    state.finalInputTokens = chunk.usage.prompt_tokens || 0;
+    state.finalOutputTokens = chunk.usage.completion_tokens || 0;
+    return;
+  }
   const choice = chunk.choices?.[0];
   if (!choice) return;
   const delta = choice.delta || {};
@@ -216,7 +222,7 @@ function* toAnthropicEvents(chunk, state) {
     yield `event: message_start\ndata: ${JSON.stringify({
       type: 'message_start',
       message: {
-        id: chunk.id || `msg_${Date.now()}`,
+        id: `msg_${Date.now()}`,
         type: 'message',
         role: 'assistant',
         model: state.claudeModel,
@@ -298,10 +304,9 @@ function* toAnthropicEvents(chunk, state) {
     yield `event: message_delta\ndata: ${JSON.stringify({
       type: 'message_delta',
       delta: { stop_reason: stopReason, stop_sequence: null },
-      usage: { output_tokens: outputTokens },
+      usage: { input_tokens: inputTokens, output_tokens: outputTokens },
     })}\n\n`;
     yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
-    yield `data: [DONE]\n\n`;
 
     state.done = true;
     state.finalInputTokens = inputTokens;
