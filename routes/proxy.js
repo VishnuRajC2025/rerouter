@@ -418,10 +418,12 @@ router.use(async (req, res) => {
     db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id);
 
     if (isStream) {
-      res.setHeader('content-type', 'text/event-stream');
-      res.setHeader('cache-control', 'no-cache');
-      res.setHeader('connection', 'keep-alive');
-      res.status(200);
+      if (!res.headersSent) {
+        res.setHeader('content-type', 'text/event-stream');
+        res.setHeader('cache-control', 'no-cache');
+        res.setHeader('connection', 'keep-alive');
+        res.status(200);
+      }
 
       // Send keep-alive pings every 5s so Claude Code doesn't time out
       // while the model is thinking before its first token
