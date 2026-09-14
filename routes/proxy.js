@@ -96,8 +96,9 @@ function validateToken(raw) {
   return { row };
 }
 
-const TOOL_RESULT_LIMIT = 2000; // chars — old tool results beyond last 10 msgs get capped
-const RECENT_MSGS = 10;         // keep last N messages' tool results fully intact
+const TOOL_RESULT_LIMIT = 2000;        // chars — old tool results get capped at this
+const TOOL_RESULT_LIMIT_RECENT = 8000; // chars — recent tool results (last 10 msgs) capped here
+const RECENT_MSGS = 10;                // boundary between old and recent
 
 // Convert Anthropic messages + system → OpenAI messages
 function toOpenAIMessages(system, messages) {
@@ -126,9 +127,10 @@ function toOpenAIMessages(system, messages) {
         let content = typeof block.content === 'string'
           ? block.content
           : (Array.isArray(block.content) ? block.content.map(b => b.text || '').join('') : '');
-        // Truncate old tool results to reduce token usage
-        if (!isRecent && content.length > TOOL_RESULT_LIMIT) {
-          content = content.slice(0, TOOL_RESULT_LIMIT) + '\n[...truncated]';
+        // Truncate tool results — old ones aggressively, recent ones softly
+        const limit = isRecent ? TOOL_RESULT_LIMIT_RECENT : TOOL_RESULT_LIMIT;
+        if (content.length > limit) {
+          content = content.slice(0, limit) + '\n[...truncated]';
         }
         result.push({ role: 'tool', tool_call_id: block.tool_use_id, content });
       }
