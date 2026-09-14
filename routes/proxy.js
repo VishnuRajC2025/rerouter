@@ -5,21 +5,25 @@ const router = express.Router();
 
 const FREE_BASE = (process.env.FREE_BACKEND_URL || 'https://api.groq.com/openai/v1').replace(/\/$/, '');
 
-// Global rate limit gate — when backend is rate limited, hold all requests until window clears
-// After gate opens, stagger releases 3s apart to avoid immediately re-triggering rate limit
-const rateLimitGate = { blockedUntil: 0, releaseSlot: 0 };
+// Global rate limit gate — holds requests when backend is rate limited
+const rateLimitGate = { blockedUntil: 0, releaseSlot: 0, queued: 0 };
+const MAX_QUEUED = 6; // beyond this, reject fast so client retries on its own
 
 async function waitForRateLimit(isStream, res) {
   const now = Date.now();
-  const gateWait = rateLimitGate.blockedUntil - now;
+  if (rateLimitGate.blockedUntil <= now && rateLimitGate.releaseSlot <= now) return;
 
-  if (gateWait <= 0 && rateLimitGate.releaseSlot <= now) return;
+  // Reject if queue is full — client will retry in a few seconds on its own
+  if (rateLimitGate.queued >= MAX_QUEUED) {
+    return 'overloaded';
+  }
 
-  // Claim a staggered release slot (3s apart per request after gate opens)
-  rateLimitGate.releaseSlot = Math.max(rateLimitGate.blockedUntil, rateLimitGate.releaseSlot) + 3000;
+  // Claim a staggered slot (1s apart per request after gate opens)
+  rateLimitGate.queued++;
+  rateLimitGate.releaseSlot = Math.max(rateLimitGate.blockedUntil, rateLimitGate.releaseSlot) + 1000;
   const totalWait = rateLimitGate.releaseSlot - now;
 
-  console.log(`Rate gate: holding for ${Math.ceil(totalWait/1000)}s...`);
+  console.log(`Rate gate: holding for ${Math.ceil(totalWait/1000)}s (${rateLimitGate.queued} queued)...`);
 
   if (isStream && !res.headersSent) {
     res.setHeader('content-type', 'text/event-stream');
@@ -34,6 +38,7 @@ async function waitForRateLimit(isStream, res) {
   } else {
     await new Promise(r => setTimeout(r, totalWait));
   }
+  rateLimitGate.queued--;
 }
 
 // Auto-refreshing token manager for Open WebUI
@@ -410,7 +415,11 @@ router.use(async (req, res) => {
 
   try {
     // Wait if global rate limit is active (set by a previous request hitting the limit)
-    await waitForRateLimit(isStream, res);
+    const gateResult = await waitForRateLimit(isStream, res);
+    if (gateResult === 'overloaded') {
+      console.log('Queue full — returning 529 so client retries shortly');
+      return res.status(529).json({ type: 'error', error: { type: 'overloaded_error', message: 'Server busy, please retry in a moment' } });
+    }
 
     async function fetchUpstream() {
       return fetch(`${FREE_BASE}/chat/completions`, {
