@@ -41,7 +41,10 @@ async function waitForRateLimit(isStream, res, userId) {
     res.status(200);
   }
   if (isStream) {
-    const iv = setInterval(() => res.write(': ping\n\n'), 5000);
+    const iv = setInterval(() => {
+      try { if (!res.writableEnded) res.write(': ping\n\n'); }
+      catch (_) { clearInterval(iv); }
+    }, 5000);
     await new Promise(r => setTimeout(r, totalWait));
     clearInterval(iv);
   } else {
@@ -156,7 +159,17 @@ function sanitizeString(s) {
 // Convert Anthropic messages + system → OpenAI messages
 function toOpenAIMessages(system, messages) {
   const result = [];
-  if (system) result.push({ role: 'system', content: sanitizeString(typeof system === 'string' ? system : JSON.stringify(system)) });
+  if (system) {
+    let sysText;
+    if (typeof system === 'string') {
+      sysText = system;
+    } else if (Array.isArray(system)) {
+      sysText = system.map(b => (typeof b === 'string' ? b : b.text || '')).join('\n');
+    } else {
+      sysText = String(system);
+    }
+    result.push({ role: 'system', content: sanitizeString(sysText) });
+  }
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -187,7 +200,7 @@ function toOpenAIMessages(system, messages) {
         result.push({ role: 'tool', tool_call_id: block.tool_use_id, content: sanitizeString(content) });
       }
       if (textBlocks.length > 0) {
-        result.push({ role: msg.role, content: textBlocks.map(b => b.text).join('') });
+        result.push({ role: msg.role, content: sanitizeString(textBlocks.map(b => b.text).join('')) });
       }
     } else if (toolUseBlocks.length > 0) {
       result.push({
@@ -374,6 +387,24 @@ function* toAnthropicEvents(chunk, state) {
   }
 }
 
+function sendError(res, isStream, statusCode, message, claudeModel) {
+  if (!res.headersSent) {
+    return res.status(statusCode).json({ type: 'error', error: { type: 'api_error', message } });
+  }
+  // Headers already sent (SSE mode) — send error as stream event
+  try {
+    if (!res.writableEnded) {
+      res.write(`event: message_start\ndata: ${JSON.stringify({ type:'message_start', message:{ id:`msg_${Date.now()}`, type:'message', role:'assistant', model:claudeModel||'unknown', content:[], stop_reason:null, usage:{input_tokens:0,output_tokens:0} } })}\n\n`);
+      res.write(`event: content_block_start\ndata: ${JSON.stringify({ type:'content_block_start', index:0, content_block:{type:'text',text:''} })}\n\n`);
+      res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type:'content_block_delta', index:0, delta:{type:'text_delta', text:`[Error: ${message.slice(0, 200)}]`} })}\n\n`);
+      res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type:'content_block_stop', index:0 })}\n\n`);
+      res.write(`event: message_delta\ndata: ${JSON.stringify({ type:'message_delta', delta:{stop_reason:'end_turn'}, usage:{output_tokens:0} })}\n\n`);
+      res.write(`event: message_stop\ndata: ${JSON.stringify({ type:'message_stop' })}\n\n`);
+      res.end();
+    }
+  } catch (_) { try { res.end(); } catch (__) {} }
+}
+
 router.use(async (req, res) => {
   const raw = extractToken(req);
   const { error, status, row } = validateToken(raw);
@@ -403,9 +434,15 @@ router.use(async (req, res) => {
 
   // count_tokens — return a fake estimate so clients don't error
   if (req.path === '/messages/count_tokens') {
+    let charCount = 0;
     const msgs = body.messages || [];
-    const roughTokens = Math.ceil(JSON.stringify(msgs).length / 4);
-    return res.json({ input_tokens: roughTokens });
+    for (const m of msgs) {
+      if (typeof m.content === 'string') charCount += m.content.length;
+      else if (Array.isArray(m.content)) {
+        for (const b of m.content) charCount += (b.text || '').length;
+      }
+    }
+    return res.json({ input_tokens: Math.ceil(charCount / 4) });
   }
 
   // Only translate /messages
@@ -452,7 +489,7 @@ router.use(async (req, res) => {
     const gateResult = await waitForRateLimit(isStream, res, row.id);
     if (gateResult === 'overloaded') {
       console.log(`Queue full — returning 529 (user ${row.id})`);
-      return res.status(529).json({ type: 'error', error: { type: 'overloaded_error', message: 'Server busy, please retry in a moment' } });
+      return sendError(res, isStream, 529, 'Server busy, please retry in a moment', claudeModel);
     }
 
     async function fetchUpstream() {
@@ -480,14 +517,11 @@ router.use(async (req, res) => {
         if (!upstream.ok) {
           const retryErr = await upstream.text();
           console.error('Upstream error after retry:', upstream.status, retryErr);
-          return res.status(upstream.status).json({ type: 'error', error: { type: 'api_error', message: retryErr } });
+          return sendError(res, isStream, upstream.status, retryErr, claudeModel);
         }
       } else {
         console.error('Upstream error:', upstream.status, errText);
-        return res.status(upstream.status).json({
-          type: 'error',
-          error: { type: 'api_error', message: `Upstream error: ${errText}` },
-        });
+        return sendError(res, isStream, upstream.status, errText, claudeModel);
       }
     }
 
@@ -501,13 +535,19 @@ router.use(async (req, res) => {
         res.status(200);
       }
 
-      // Send keep-alive pings every 5s so Claude Code doesn't time out
-      // while the model is thinking before its first token
-      const keepAlive = setInterval(() => res.write(': ping\n\n'), 5000);
+      const keepAlive = setInterval(() => {
+        try { if (!res.writableEnded) res.write(': ping\n\n'); }
+        catch (_) { clearInterval(keepAlive); }
+      }, 5000);
 
       const reader = upstream.body.getReader();
       const decoder = new TextDecoder();
       const state = { claudeModel, started: false };
+
+      // Abort upstream reader if client disconnects
+      req.on('close', () => {
+        try { reader.cancel(); } catch (_) {}
+      });
       let buffer = '';
 
       const pump = async () => {
@@ -525,31 +565,55 @@ router.use(async (req, res) => {
               let chunk;
               try { chunk = JSON.parse(payload); } catch (_) { continue; }
               for (const event of toAnthropicEvents(chunk, state)) {
+                if (res.writableEnded) break;
                 res.write(event);
               }
             }
           }
+          // Process any remaining data in buffer after stream ends
+          if (buffer.trim().startsWith('data: ')) {
+            const payload = buffer.trim().slice(6).trim();
+            if (payload && payload !== '[DONE]') {
+              try {
+                const chunk = JSON.parse(payload);
+                for (const event of toAnthropicEvents(chunk, state)) {
+                  if (res.writableEnded) break;
+                  res.write(event);
+                }
+              } catch (_) {}
+            }
+          }
           clearInterval(keepAlive);
+          // If stream ended but we never emitted message_stop, emit it now
+          if (!state.done && !res.writableEnded) {
+            if (state.started) {
+              if (state.blockOpen) {
+                res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type:'content_block_stop', index:state.blockIndex })}\n\n`);
+              }
+              res.write(`event: message_delta\ndata: ${JSON.stringify({ type:'message_delta', delta:{stop_reason:'end_turn', stop_sequence:null}, usage:{input_tokens:state.finalInputTokens||0, output_tokens:state.finalOutputTokens||state.outputTokens||0} })}\n\n`);
+              res.write(`event: message_stop\ndata: ${JSON.stringify({ type:'message_stop' })}\n\n`);
+            }
+          }
           res.end();
           logUsage(row.id, claudeModel, state.finalInputTokens || 0, state.finalOutputTokens || 0);
         } catch (err) {
           clearInterval(keepAlive);
           console.error('Stream error:', err.message);
-          // Send a clean message_stop so Claude Code doesn't hang
-          if (!res.writableEnded) {
-            if (!state.started) {
-              // Nothing sent yet — send minimal valid Anthropic error response
-              res.write(`event: message_start\ndata: ${JSON.stringify({ type:'message_start', message:{ id:`msg_${Date.now()}`, type:'message', role:'assistant', model:claudeModel, content:[], stop_reason:null, usage:{input_tokens:0,output_tokens:0} } })}\n\n`);
-              res.write(`event: content_block_start\ndata: ${JSON.stringify({ type:'content_block_start', index:0, content_block:{type:'text',text:''} })}\n\n`);
-              res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type:'content_block_delta', index:0, delta:{type:'text_delta', text:'[Connection dropped. Please resend your message.]'} })}\n\n`);
-              res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type:'content_block_stop', index:0 })}\n\n`);
-            } else if (state.blockOpen) {
-              res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type:'content_block_stop', index:state.blockIndex })}\n\n`);
+          try {
+            if (!res.writableEnded) {
+              if (!state.started) {
+                res.write(`event: message_start\ndata: ${JSON.stringify({ type:'message_start', message:{ id:`msg_${Date.now()}`, type:'message', role:'assistant', model:claudeModel, content:[], stop_reason:null, usage:{input_tokens:0,output_tokens:0} } })}\n\n`);
+                res.write(`event: content_block_start\ndata: ${JSON.stringify({ type:'content_block_start', index:0, content_block:{type:'text',text:''} })}\n\n`);
+                res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type:'content_block_delta', index:0, delta:{type:'text_delta', text:'[Connection dropped. Please resend your message.]'} })}\n\n`);
+                res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type:'content_block_stop', index:0 })}\n\n`);
+              } else if (state.blockOpen) {
+                res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type:'content_block_stop', index:state.blockIndex })}\n\n`);
+              }
+              res.write(`event: message_delta\ndata: ${JSON.stringify({ type:'message_delta', delta:{stop_reason:'end_turn'}, usage:{output_tokens:state.outputTokens||0} })}\n\n`);
+              res.write(`event: message_stop\ndata: ${JSON.stringify({ type:'message_stop' })}\n\n`);
+              res.end();
             }
-            res.write(`event: message_delta\ndata: ${JSON.stringify({ type:'message_delta', delta:{stop_reason:'end_turn'}, usage:{output_tokens:state.outputTokens||0} })}\n\n`);
-            res.write(`event: message_stop\ndata: ${JSON.stringify({ type:'message_stop' })}\n\n`);
-            res.end();
-          }
+          } catch (_) { try { res.end(); } catch (__) {} }
         }
       };
       pump().catch(err => console.error('Unhandled pump error:', err.message));
