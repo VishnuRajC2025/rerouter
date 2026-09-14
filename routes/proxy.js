@@ -6,12 +6,21 @@ const router = express.Router();
 const FREE_BASE = (process.env.FREE_BACKEND_URL || 'https://api.groq.com/openai/v1').replace(/\/$/, '');
 
 // Global rate limit gate — when backend is rate limited, hold all requests until window clears
-const rateLimitGate = { blockedUntil: 0 };
+// After gate opens, stagger releases 3s apart to avoid immediately re-triggering rate limit
+const rateLimitGate = { blockedUntil: 0, releaseSlot: 0 };
 
 async function waitForRateLimit(isStream, res) {
-  const wait = rateLimitGate.blockedUntil - Date.now();
-  if (wait <= 0) return;
-  console.log(`Global rate limit active, holding request for ${Math.ceil(wait/1000)}s...`);
+  const now = Date.now();
+  const gateWait = rateLimitGate.blockedUntil - now;
+
+  if (gateWait <= 0 && rateLimitGate.releaseSlot <= now) return;
+
+  // Claim a staggered release slot (3s apart per request after gate opens)
+  rateLimitGate.releaseSlot = Math.max(rateLimitGate.blockedUntil, rateLimitGate.releaseSlot) + 3000;
+  const totalWait = rateLimitGate.releaseSlot - now;
+
+  console.log(`Rate gate: holding for ${Math.ceil(totalWait/1000)}s...`);
+
   if (isStream && !res.headersSent) {
     res.setHeader('content-type', 'text/event-stream');
     res.setHeader('cache-control', 'no-cache');
@@ -20,10 +29,10 @@ async function waitForRateLimit(isStream, res) {
   }
   if (isStream) {
     const iv = setInterval(() => res.write(': ping\n\n'), 5000);
-    await new Promise(r => setTimeout(r, wait));
+    await new Promise(r => setTimeout(r, totalWait));
     clearInterval(iv);
   } else {
-    await new Promise(r => setTimeout(r, wait));
+    await new Promise(r => setTimeout(r, totalWait));
   }
 }
 
