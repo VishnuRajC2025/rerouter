@@ -5,6 +5,28 @@ const router = express.Router();
 
 const FREE_BASE = (process.env.FREE_BACKEND_URL || 'https://api.groq.com/openai/v1').replace(/\/$/, '');
 
+// Global rate limit gate — when backend is rate limited, hold all requests until window clears
+const rateLimitGate = { blockedUntil: 0 };
+
+async function waitForRateLimit(isStream, res) {
+  const wait = rateLimitGate.blockedUntil - Date.now();
+  if (wait <= 0) return;
+  console.log(`Global rate limit active, holding request for ${Math.ceil(wait/1000)}s...`);
+  if (isStream && !res.headersSent) {
+    res.setHeader('content-type', 'text/event-stream');
+    res.setHeader('cache-control', 'no-cache');
+    res.setHeader('connection', 'keep-alive');
+    res.status(200);
+  }
+  if (isStream) {
+    const iv = setInterval(() => res.write(': ping\n\n'), 5000);
+    await new Promise(r => setTimeout(r, wait));
+    clearInterval(iv);
+  } else {
+    await new Promise(r => setTimeout(r, wait));
+  }
+}
+
 // Auto-refreshing token manager for Open WebUI
 const tokenCache = {
   token: process.env.FREE_BACKEND_KEY || '',
@@ -378,10 +400,11 @@ router.use(async (req, res) => {
   if (isStream) openAIBody.stream_options = { include_usage: true };
 
   try {
-    // Retry up to 3 times on rate limit (wait 65s between attempts)
-    let upstream, attempts = 0;
-    while (true) {
-      upstream = await fetch(`${FREE_BASE}/chat/completions`, {
+    // Wait if global rate limit is active (set by a previous request hitting the limit)
+    await waitForRateLimit(isStream, res);
+
+    async function fetchUpstream() {
+      return fetch(`${FREE_BASE}/chat/completions`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
@@ -389,37 +412,31 @@ router.use(async (req, res) => {
         },
         body: JSON.stringify(openAIBody),
       });
+    }
 
-      if (upstream.ok) break;
+    let upstream = await fetchUpstream();
 
+    if (!upstream.ok) {
       const errText = await upstream.text();
       const isRateLimit = upstream.status === 429 || (upstream.status === 400 && errText.includes('RateLimitError'));
 
-      if (isRateLimit && attempts < 3) {
-        attempts++;
-        console.log(`Rate limited, waiting 65s before retry ${attempts}/3...`);
-        // Send keep-alive during wait so client doesn't disconnect
-        if (isStream && !res.headersSent) {
-          res.setHeader('content-type', 'text/event-stream');
-          res.setHeader('cache-control', 'no-cache');
-          res.setHeader('connection', 'keep-alive');
-          res.status(200);
+      if (isRateLimit) {
+        rateLimitGate.blockedUntil = Date.now() + 65_000;
+        console.log('Rate limit hit — global gate set for 65s');
+        await waitForRateLimit(isStream, res);
+        upstream = await fetchUpstream();
+        if (!upstream.ok) {
+          const retryErr = await upstream.text();
+          console.error('Upstream error after retry:', upstream.status, retryErr);
+          return res.status(upstream.status).json({ type: 'error', error: { type: 'api_error', message: retryErr } });
         }
-        if (isStream) {
-          const waitInterval = setInterval(() => res.write(': ping\n\n'), 5000);
-          await new Promise(r => setTimeout(r, 65_000));
-          clearInterval(waitInterval);
-        } else {
-          await new Promise(r => setTimeout(r, 65_000));
-        }
-        continue;
+      } else {
+        console.error('Upstream error:', upstream.status, errText);
+        return res.status(upstream.status).json({
+          type: 'error',
+          error: { type: 'api_error', message: `Upstream error: ${errText}` },
+        });
       }
-
-      console.error('Upstream error:', upstream.status, errText);
-      return res.status(upstream.status).json({
-        type: 'error',
-        error: { type: 'api_error', message: `Upstream error: ${errText}` },
-      });
     }
 
     db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id);
