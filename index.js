@@ -2,6 +2,13 @@ require('dotenv').config();
 const express = require('express');
 const app = express();
 
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection (caught):', err?.message || err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (caught):', err?.message || err);
+});
+
 if (!process.env.ANTHROPIC_AUTH_TOKEN) {
   console.error('ERROR: ANTHROPIC_AUTH_TOKEN is not set in .env');
   process.exit(1);

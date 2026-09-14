@@ -145,22 +145,29 @@ function validateToken(raw) {
 const TOOL_RESULT_LIMIT = 2000;        // chars — old tool results get capped at this
 const TOOL_RESULT_LIMIT_RECENT = 8000; // chars — recent tool results (last 10 msgs) capped here
 const RECENT_MSGS = 10;                // boundary between old and recent
+const MAX_TOOL_DESC_LENGTH = 500;      // chars — truncate long tool descriptions
+
+// Strip broken Unicode surrogates that cause "no low surrogate" JSON errors
+function sanitizeString(s) {
+  if (typeof s !== 'string') return s;
+  return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '�');
+}
 
 // Convert Anthropic messages + system → OpenAI messages
 function toOpenAIMessages(system, messages) {
   const result = [];
-  if (system) result.push({ role: 'system', content: system });
+  if (system) result.push({ role: 'system', content: sanitizeString(typeof system === 'string' ? system : JSON.stringify(system)) });
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     const isRecent = i >= messages.length - RECENT_MSGS;
 
     if (typeof msg.content === 'string') {
-      result.push({ role: msg.role, content: msg.content });
+      result.push({ role: msg.role, content: sanitizeString(msg.content) });
       continue;
     }
     if (!Array.isArray(msg.content)) {
-      result.push({ role: msg.role, content: String(msg.content || '') });
+      result.push({ role: msg.role, content: sanitizeString(String(msg.content || '')) });
       continue;
     }
 
@@ -173,12 +180,11 @@ function toOpenAIMessages(system, messages) {
         let content = typeof block.content === 'string'
           ? block.content
           : (Array.isArray(block.content) ? block.content.map(b => b.text || '').join('') : '');
-        // Truncate tool results — old ones aggressively, recent ones softly
         const limit = isRecent ? TOOL_RESULT_LIMIT_RECENT : TOOL_RESULT_LIMIT;
         if (content.length > limit) {
           content = content.slice(0, limit) + '\n[...truncated]';
         }
-        result.push({ role: 'tool', tool_call_id: block.tool_use_id, content });
+        result.push({ role: 'tool', tool_call_id: block.tool_use_id, content: sanitizeString(content) });
       }
       if (textBlocks.length > 0) {
         result.push({ role: msg.role, content: textBlocks.map(b => b.text).join('') });
@@ -186,15 +192,15 @@ function toOpenAIMessages(system, messages) {
     } else if (toolUseBlocks.length > 0) {
       result.push({
         role: 'assistant',
-        content: textBlocks.map(b => b.text).join('') || null,
+        content: sanitizeString(textBlocks.map(b => b.text).join('')) || null,
         tool_calls: toolUseBlocks.map(block => ({
           id: block.id,
           type: 'function',
-          function: { name: block.name, arguments: JSON.stringify(block.input) },
+          function: { name: block.name, arguments: sanitizeString(JSON.stringify(block.input)) },
         })),
       });
     } else {
-      result.push({ role: msg.role, content: textBlocks.map(b => b.text).join('') });
+      result.push({ role: msg.role, content: sanitizeString(textBlocks.map(b => b.text).join('')) });
     }
   }
   return result;
@@ -203,14 +209,20 @@ function toOpenAIMessages(system, messages) {
 // Convert Anthropic tools → OpenAI tools
 function toOpenAITools(tools) {
   if (!tools || !tools.length) return undefined;
-  return tools.map(t => ({
-    type: 'function',
-    function: {
-      name: t.name,
-      description: t.description || '',
-      parameters: t.input_schema || { type: 'object', properties: {} },
-    },
-  }));
+  return tools.map(t => {
+    let desc = t.description || '';
+    if (desc.length > MAX_TOOL_DESC_LENGTH) {
+      desc = desc.slice(0, MAX_TOOL_DESC_LENGTH) + '...';
+    }
+    return {
+      type: 'function',
+      function: {
+        name: t.name,
+        description: desc,
+        parameters: t.input_schema || { type: 'object', properties: {} },
+      },
+    };
+  });
 }
 
 // Convert OpenAI response → Anthropic response
@@ -367,10 +379,10 @@ router.use(async (req, res) => {
   const { error, status, row } = validateToken(raw);
   if (error) return res.status(status).json({ error });
 
-  // Log request size to diagnose 32MB issue
-  const bodyStr = JSON.stringify(req.body);
-  const bodyBytes = Buffer.byteLength(bodyStr, 'utf8');
-  console.log(`[${req.path}] model=${req.body?.model} msgs=${req.body?.messages?.length} tools=${req.body?.tools?.length || 0} bodySize=${(bodyBytes/1024).toFixed(1)}KB`);
+  // Lightweight logging — estimate body size without serializing the whole thing
+  const msgCount = req.body?.messages?.length || 0;
+  const toolCount = req.body?.tools?.length || 0;
+  console.log(`[${req.path}] model=${req.body?.model} msgs=${msgCount} tools=${toolCount}`);
 
   // Models list — return fake Claude model list
   if (req.path === '/models' || req.path === '/models/') {
@@ -387,12 +399,19 @@ router.use(async (req, res) => {
     });
   }
 
+  const body = req.body;
+
+  // count_tokens — return a fake estimate so clients don't error
+  if (req.path === '/messages/count_tokens') {
+    const msgs = body.messages || [];
+    const roughTokens = Math.ceil(JSON.stringify(msgs).length / 4);
+    return res.json({ input_tokens: roughTokens });
+  }
+
   // Only translate /messages
   if (req.path !== '/messages' && req.path !== '/messages/') {
     return res.status(404).json({ type: 'error', error: { type: 'not_found_error', message: 'Not found' } });
   }
-
-  const body = req.body;
   const claudeModel = body.model || 'claude-opus-4-5';
   const isStream = body.stream === true;
 
@@ -423,6 +442,11 @@ router.use(async (req, res) => {
   if (openAITools) openAIBody.tools = openAITools;
   if (isStream) openAIBody.stream_options = { include_usage: true };
 
+  // Log actual forwarded body size (after truncation)
+  const fwdBody = JSON.stringify(openAIBody);
+  const fwdKB = (Buffer.byteLength(fwdBody, 'utf8') / 1024).toFixed(1);
+  console.log(`  → forwarding: model=${openAIBody.model} msgs=${openAIBody.messages.length} tools=${openAIBody.tools?.length || 0} fwdSize=${fwdKB}KB`);
+
   try {
     // Wait if global rate limit is active (set by a previous request hitting the limit)
     const gateResult = await waitForRateLimit(isStream, res, row.id);
@@ -438,7 +462,7 @@ router.use(async (req, res) => {
           'content-type': 'application/json',
           'authorization': `Bearer ${await getKey()}`,
         },
-        body: JSON.stringify(openAIBody),
+        body: fwdBody,
       });
     }
 
@@ -528,7 +552,7 @@ router.use(async (req, res) => {
           }
         }
       };
-      pump();
+      pump().catch(err => console.error('Unhandled pump error:', err.message));
     } else {
       const data = await upstream.json();
       const anthropicResp = toAnthropicResponse(data, claudeModel);
@@ -536,8 +560,12 @@ router.use(async (req, res) => {
       logUsage(row.id, claudeModel, anthropicResp.usage.input_tokens, anthropicResp.usage.output_tokens);
     }
   } catch (err) {
-    console.error('Proxy error:', err);
-    res.status(502).json({ type: 'error', error: { type: 'api_error', message: err.message } });
+    console.error('Proxy error:', err.message);
+    if (!res.headersSent) {
+      res.status(502).json({ type: 'error', error: { type: 'api_error', message: err.message } });
+    } else if (!res.writableEnded) {
+      res.end();
+    }
   }
 });
 
