@@ -371,25 +371,51 @@ router.use(async (req, res) => {
   if (isStream) openAIBody.stream_options = { include_usage: true };
 
   try {
-    const upstream = await fetch(`${FREE_BASE}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'authorization': `Bearer ${await getKey()}`,
-      },
-      body: JSON.stringify(openAIBody),
-    });
+    // Retry up to 3 times on rate limit (wait 65s between attempts)
+    let upstream, attempts = 0;
+    while (true) {
+      upstream = await fetch(`${FREE_BASE}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'authorization': `Bearer ${await getKey()}`,
+        },
+        body: JSON.stringify(openAIBody),
+      });
 
-    db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id);
+      if (upstream.ok) break;
 
-    if (!upstream.ok) {
       const errText = await upstream.text();
+      const isRateLimit = upstream.status === 429 || (upstream.status === 400 && errText.includes('RateLimitError'));
+
+      if (isRateLimit && attempts < 3) {
+        attempts++;
+        console.log(`Rate limited, waiting 65s before retry ${attempts}/3...`);
+        // Send keep-alive during wait so client doesn't disconnect
+        if (isStream && !res.headersSent) {
+          res.setHeader('content-type', 'text/event-stream');
+          res.setHeader('cache-control', 'no-cache');
+          res.setHeader('connection', 'keep-alive');
+          res.status(200);
+        }
+        if (isStream) {
+          const waitInterval = setInterval(() => res.write(': ping\n\n'), 5000);
+          await new Promise(r => setTimeout(r, 65_000));
+          clearInterval(waitInterval);
+        } else {
+          await new Promise(r => setTimeout(r, 65_000));
+        }
+        continue;
+      }
+
       console.error('Upstream error:', upstream.status, errText);
       return res.status(upstream.status).json({
         type: 'error',
         error: { type: 'api_error', message: `Upstream error: ${errText}` },
       });
     }
+
+    db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id);
 
     if (isStream) {
       res.setHeader('content-type', 'text/event-stream');
