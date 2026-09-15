@@ -719,6 +719,7 @@ router.use(async (req, res) => {
     if (!upstream.ok) {
       const errText = await upstream.text();
       const isRateLimit = upstream.status === 429 || (upstream.status === 400 && errText.includes('RateLimitError'));
+      const isTimeout = upstream.status === 524 || upstream.status === 504 || upstream.status === 502 || upstream.status === 503;
 
       if (isRateLimit) {
         rateLimitGate.blockedUntil = Date.now() + 65_000;
@@ -727,12 +728,25 @@ router.use(async (req, res) => {
         upstream = await fetchUpstream();
         if (!upstream.ok) {
           const retryErr = await upstream.text();
-          console.error('Upstream error after retry:', upstream.status, retryErr);
-          return sendError(res, isStream, upstream.status, retryErr, claudeModel);
+          const cleanRetryErr = retryErr.includes('<html') ? `Backend error ${upstream.status}` : retryErr.slice(0, 300);
+          console.error('Upstream error after retry:', upstream.status, cleanRetryErr);
+          return sendError(res, isStream, upstream.status, cleanRetryErr, claudeModel);
+        }
+      } else if (isTimeout) {
+        // Backend timeout — wait 8s and retry once before giving up
+        console.log(`Backend timeout ${upstream.status} — retrying in 8s...`);
+        await new Promise(r => setTimeout(r, 8000));
+        upstream = await fetchUpstream();
+        if (!upstream.ok) {
+          const retryText = await upstream.text();
+          const cleanErr = retryText.includes('<html') ? `Backend timeout (${upstream.status}) — please retry your message` : retryText.slice(0, 300);
+          console.error('Upstream timeout after retry:', upstream.status);
+          return sendError(res, isStream, 503, cleanErr, claudeModel);
         }
       } else {
-        console.error('Upstream error:', upstream.status, errText);
-        return sendError(res, isStream, upstream.status, errText, claudeModel);
+        const cleanErr = errText.includes('<html') ? `Backend error ${upstream.status}` : errText.slice(0, 300);
+        console.error('Upstream error:', upstream.status, cleanErr);
+        return sendError(res, isStream, upstream.status, cleanErr, claudeModel);
       }
     }
 
