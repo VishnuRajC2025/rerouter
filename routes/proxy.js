@@ -219,6 +219,186 @@ function toOpenAIMessages(system, messages) {
   return result;
 }
 
+// === Built-in tool execution (web_search, web_fetch) ===
+
+const BUILTIN_TOOL_NAMES = new Set(['web_search', 'web_fetch']);
+
+function isBuiltinTool(tool) {
+  if (BUILTIN_TOOL_NAMES.has(tool.name)) return true;
+  const t = tool.type || '';
+  return t.startsWith('web_search') || t.startsWith('web_fetch');
+}
+
+function separateTools(tools) {
+  if (!tools || !tools.length) return { userTools: [], builtinTools: [] };
+  const userTools = [], builtinTools = [];
+  for (const t of tools) (isBuiltinTool(t) ? builtinTools : userTools).push(t);
+  return { userTools, builtinTools };
+}
+
+async function execWebSearch(query) {
+  if (process.env.BRAVE_SEARCH_API_KEY) {
+    try {
+      const resp = await fetch(
+        `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=8`,
+        {
+          headers: { 'Accept': 'application/json', 'X-Subscription-Token': process.env.BRAVE_SEARCH_API_KEY },
+          signal: AbortSignal.timeout(12000),
+        }
+      );
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      const results = data.web?.results || [];
+      if (!results.length) return 'No results found.';
+      return results.slice(0, 6).map((r, i) =>
+        `[${i+1}] ${r.title}\nURL: ${r.url}\n${r.description || ''}`
+      ).join('\n\n');
+    } catch (err) {
+      console.error('Brave search error:', err.message);
+    }
+  }
+  // DuckDuckGo instant answers fallback
+  try {
+    const resp = await fetch(
+      `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`,
+      { signal: AbortSignal.timeout(10000) }
+    );
+    const data = await resp.json();
+    const parts = [];
+    if (data.Heading) parts.push(data.Heading);
+    if (data.AbstractText) parts.push(data.AbstractText);
+    if (data.Answer) parts.push(`Answer: ${data.Answer}`);
+    for (const t of (data.RelatedTopics || []).filter(t => t.Text).slice(0, 6)) {
+      parts.push(`• ${t.Text}${t.FirstURL ? '\n  ' + t.FirstURL : ''}`);
+    }
+    if (!parts.length) return `No results for "${query}". Add BRAVE_SEARCH_API_KEY to Railway env for full web search (free at brave.com/search/api).`;
+    return parts.join('\n\n');
+  } catch (err) {
+    return `Search unavailable: ${err.message}`;
+  }
+}
+
+async function execWebFetch(url) {
+  try {
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ResearchBot/1.0)' },
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!resp.ok) return `Failed to fetch ${url}: HTTP ${resp.status}`;
+    const ct = resp.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      const t = await resp.text();
+      return t.slice(0, 8000) + (t.length > 8000 ? '\n[...truncated]' : '');
+    }
+    const html = await resp.text();
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#39;/gi, "'")
+      .replace(/\s+/g, ' ').trim();
+    return text.slice(0, 8000) + (text.length > 8000 ? '\n[...truncated]' : '');
+  } catch (err) {
+    return `Fetch failed: ${err.message}`;
+  }
+}
+
+// Execute builtin tools in a loop until model returns a final text answer
+async function runToolLoop(messages, baseBody, builtinTools, claudeModel) {
+  const MAX_ROUNDS = 5;
+  let totalInputTokens = 0, totalOutputTokens = 0;
+
+  for (let round = 0; round <= MAX_ROUNDS; round++) {
+    const body = JSON.stringify({ ...baseBody, messages, stream: false });
+    const resp = await fetch(`${FREE_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${await getKey()}` },
+      body,
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw Object.assign(new Error(text), { status: resp.status });
+    }
+    const data = await resp.json();
+    const anthropicResp = toAnthropicResponse(data, claudeModel);
+    totalInputTokens += anthropicResp.usage?.input_tokens || 0;
+    totalOutputTokens += anthropicResp.usage?.output_tokens || 0;
+
+    const toolUses = anthropicResp.content.filter(b => b.type === 'tool_use');
+    const builtinCalls = toolUses.filter(tu => isBuiltinTool({ name: tu.name, type: tu.name }));
+    const userCalls = toolUses.filter(tu => !builtinCalls.includes(tu));
+
+    // No tool calls, or user tool calls → return as-is (client handles user tools)
+    if (!toolUses.length || anthropicResp.stop_reason !== 'tool_use' || userCalls.length > 0 || round === MAX_ROUNDS) {
+      anthropicResp.usage = { input_tokens: totalInputTokens, output_tokens: totalOutputTokens };
+      return anthropicResp;
+    }
+
+    // Add assistant's tool_call message
+    const textBlock = anthropicResp.content.find(b => b.type === 'text');
+    messages = [...messages, {
+      role: 'assistant',
+      content: textBlock?.text || null,
+      tool_calls: builtinCalls.map(tu => ({
+        id: tu.id, type: 'function',
+        function: { name: tu.name, arguments: JSON.stringify(tu.input) },
+      })),
+    }];
+
+    // Execute each builtin tool and add results
+    for (const tu of builtinCalls) {
+      let result;
+      if (tu.name === 'web_search' || tu.name.includes('search')) {
+        const q = tu.input?.query || tu.input?.q || tu.input?.search_query || JSON.stringify(tu.input);
+        console.log(`  → web_search round=${round}: "${q}"`);
+        result = await execWebSearch(q);
+      } else if (tu.name === 'web_fetch' || tu.name.includes('fetch')) {
+        const u = tu.input?.url || tu.input?.URL || JSON.stringify(tu.input);
+        console.log(`  → web_fetch round=${round}: ${u}`);
+        result = await execWebFetch(u);
+      } else {
+        result = `Tool "${tu.name}" not supported.`;
+      }
+      messages.push({ role: 'tool', tool_call_id: tu.id, content: result });
+    }
+  }
+}
+
+// Emit a complete Anthropic response object as SSE events
+function emitAnthropicResponseAsStream(res, anthropicResp) {
+  if (res.writableEnded) return;
+  res.write(`event: message_start\ndata: ${JSON.stringify({
+    type: 'message_start',
+    message: {
+      id: anthropicResp.id, type: 'message', role: 'assistant', model: anthropicResp.model,
+      content: [], stop_reason: null, stop_sequence: null,
+      usage: { input_tokens: anthropicResp.usage?.input_tokens || 0, output_tokens: 0 },
+    },
+  })}\n\n`);
+  res.write(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`);
+  let idx = 0;
+  for (const block of anthropicResp.content) {
+    if (block.type === 'text') {
+      res.write(`event: content_block_start\ndata: ${JSON.stringify({ type:'content_block_start', index:idx, content_block:{type:'text',text:''} })}\n\n`);
+      res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type:'content_block_delta', index:idx, delta:{type:'text_delta', text:block.text} })}\n\n`);
+      res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type:'content_block_stop', index:idx })}\n\n`);
+    } else if (block.type === 'tool_use') {
+      res.write(`event: content_block_start\ndata: ${JSON.stringify({ type:'content_block_start', index:idx, content_block:{type:'tool_use', id:block.id, name:block.name, input:{}} })}\n\n`);
+      res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type:'content_block_delta', index:idx, delta:{type:'input_json_delta', partial_json:JSON.stringify(block.input)} })}\n\n`);
+      res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type:'content_block_stop', index:idx })}\n\n`);
+    }
+    idx++;
+  }
+  res.write(`event: message_delta\ndata: ${JSON.stringify({
+    type: 'message_delta',
+    delta: { stop_reason: anthropicResp.stop_reason, stop_sequence: null },
+    usage: { input_tokens: anthropicResp.usage?.input_tokens || 0, output_tokens: anthropicResp.usage?.output_tokens || 0 },
+  })}\n\n`);
+  res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+  res.end();
+}
+
 // Convert Anthropic tools → OpenAI tools
 function toOpenAITools(tools) {
   if (!tools || !tools.length) return undefined;
@@ -475,7 +655,8 @@ router.use(async (req, res) => {
   };
   if (body.temperature !== undefined) openAIBody.temperature = body.temperature;
   if (body.top_p !== undefined) openAIBody.top_p = body.top_p;
-  const openAITools = toOpenAITools(body.tools);
+  const { userTools, builtinTools } = separateTools(body.tools);
+  const openAITools = toOpenAITools(userTools);
   if (openAITools) openAIBody.tools = openAITools;
   if (isStream) openAIBody.stream_options = { include_usage: true };
 
@@ -490,6 +671,36 @@ router.use(async (req, res) => {
     if (gateResult === 'overloaded') {
       console.log(`Queue full — returning 529 (user ${row.id})`);
       return sendError(res, isStream, 529, 'Server busy, please retry in a moment', claudeModel);
+    }
+
+    // Tool loop: intercept web_search/web_fetch, execute them here, return final answer
+    if (builtinTools.length > 0) {
+      if (isStream && !res.headersSent) {
+        res.setHeader('content-type', 'text/event-stream');
+        res.setHeader('cache-control', 'no-cache');
+        res.setHeader('connection', 'keep-alive');
+        res.status(200);
+      }
+      const keepAlive = isStream ? setInterval(() => {
+        try { if (!res.writableEnded) res.write(': ping\n\n'); }
+        catch (_) { clearInterval(keepAlive); }
+      }, 5000) : null;
+      try {
+        const anthropicResp = await runToolLoop(openAIBody.messages, openAIBody, builtinTools, claudeModel);
+        if (keepAlive) clearInterval(keepAlive);
+        db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id);
+        logUsage(row.id, claudeModel, anthropicResp.usage?.input_tokens || 0, anthropicResp.usage?.output_tokens || 0);
+        if (isStream) {
+          if (!res.writableEnded) emitAnthropicResponseAsStream(res, anthropicResp);
+        } else {
+          res.status(200).json(anthropicResp);
+        }
+      } catch (toolErr) {
+        if (keepAlive) clearInterval(keepAlive);
+        console.error('Tool loop error:', toolErr.message);
+        sendError(res, isStream, toolErr.status || 502, toolErr.message, claudeModel);
+      }
+      return;
     }
 
     async function fetchUpstream() {
