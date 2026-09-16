@@ -498,6 +498,12 @@ function* toAnthropicEvents(chunk, state) {
   }
 
   if (delta.content) {
+    // If a tool_use block is currently open, close it before opening a text block
+    if (state.blockOpen && state.blockType === 'tool_use') {
+      yield `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: state.blockIndex })}\n\n`;
+      state.blockIndex++;
+      state.blockOpen = false;
+    }
     if (!state.blockOpen) {
       yield `event: content_block_start\ndata: ${JSON.stringify({
         type: 'content_block_start', index: state.blockIndex,
