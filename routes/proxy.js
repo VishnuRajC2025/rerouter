@@ -812,9 +812,27 @@ router.use(async (req, res) => {
             });
           }
           if (!upstream.ok) {
+            // Last resort: nothingxd Gemini (Anthropic-native)
+            console.warn('CodeCraft also failed — trying nothingxd Gemini as last resort');
+            const nxBody = JSON.stringify({ ...body, model: 'gemini-3.7-flash-tiered' });
+            const nxResp = await fetch('https://proxy.nothingxd.shop/v1/messages', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', 'x-api-key': 'sk-ag-kBhWq9PMyJ-1K_GM_REnaJJChlEhPXZ-', 'anthropic-version': '2023-06-01' },
+              body: nxBody,
+            }).catch(() => null);
+            if (nxResp && nxResp.ok) {
+              db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id);
+              const ct = nxResp.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
+              res.setHeader('content-type', ct);
+              if (isStream) { res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); }
+              res.status(200);
+              const { Readable } = require('stream');
+              Readable.fromWeb(nxResp.body).pipe(res);
+              return;
+            }
             const fbErr = await upstream.text();
             const cleanErr = fbErr.includes('<html') ? `Fallback error ${upstream.status}` : fbErr.slice(0, 300);
-            console.error('Fallback also failed:', upstream.status, cleanErr);
+            console.error('All backends failed:', upstream.status, cleanErr);
             return sendError(res, isStream, upstream.status, cleanErr, claudeModel);
           }
         }
