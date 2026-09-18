@@ -679,24 +679,38 @@ router.use(async (req, res) => {
       const errText = await upstream.text();
       const isCreditsOut = upstream.status === 402 ||
         /credit|quota|balance|exhausted|billing|payment|limit reached/i.test(errText);
-      if (isCreditsOut && FREE_BASE && FALLBACK_URL === '' ) {
-        console.warn(`Primary proxy credits exhausted (${upstream.status}) — falling back to CodeCraft`);
-        // fall through to OpenAI path below
+      if (isCreditsOut) {
+        // Tier 2: nothingxd gemini-3.5-flash-lite
+        console.warn(`vyceai credits exhausted — trying nothingxd gemini-3.5-flash-lite`);
+        const nxBody = JSON.stringify({ ...body, model: 'gemini-3.5-flash-lite' });
+        const nxResp = await fetch('https://proxy.nothingxd.shop/v1/messages', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-api-key': 'sk-ag-kBhWq9PMyJ-1K_GM_REnaJJChlEhPXZ-', 'anthropic-version': '2023-06-01' },
+          body: nxBody,
+        }).catch(() => null);
+        if (nxResp && nxResp.ok) {
+          setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
+          const ct = nxResp.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
+          res.setHeader('content-type', ct);
+          if (isStream) { res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); }
+          res.status(200);
+          const { Readable } = require('stream');
+          Readable.fromWeb(nxResp.body).pipe(res);
+          return;
+        }
+        console.warn('nothingxd also failed — falling back to CodeCraft (OpenAI path)');
+        // fall through to OpenAI/CodeCraft path below
       } else {
         const cleanErr = errText.includes('<html') ? `Proxy error ${upstream.status}` : errText.slice(0, 300);
         console.error(`Proxy ${upstream.status}:`, cleanErr);
         return sendError(res, isStream, upstream.status, cleanErr, claudeModel);
       }
     } else {
-      // Fire-and-forget DB counter (don't block response)
       setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
-
-      // Copy upstream headers and pipe bytes directly — no parsing
       const ct = upstream.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
       res.setHeader('content-type', ct);
       if (isStream) { res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); }
       res.status(upstream.status);
-
       const { Readable } = require('stream');
       req.on('close', () => { try { upstream.body.cancel(); } catch (_) {} });
       Readable.fromWeb(upstream.body).pipe(res);
@@ -812,24 +826,6 @@ router.use(async (req, res) => {
             });
           }
           if (!upstream.ok) {
-            // Last resort: nothingxd Gemini (Anthropic-native)
-            console.warn('CodeCraft also failed — trying nothingxd Gemini as last resort');
-            const nxBody = JSON.stringify({ ...body, model: 'gemini-3.7-flash-tiered' });
-            const nxResp = await fetch('https://proxy.nothingxd.shop/v1/messages', {
-              method: 'POST',
-              headers: { 'content-type': 'application/json', 'x-api-key': 'sk-ag-kBhWq9PMyJ-1K_GM_REnaJJChlEhPXZ-', 'anthropic-version': '2023-06-01' },
-              body: nxBody,
-            }).catch(() => null);
-            if (nxResp && nxResp.ok) {
-              db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id);
-              const ct = nxResp.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
-              res.setHeader('content-type', ct);
-              if (isStream) { res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); }
-              res.status(200);
-              const { Readable } = require('stream');
-              Readable.fromWeb(nxResp.body).pipe(res);
-              return;
-            }
             const fbErr = await upstream.text();
             const cleanErr = fbErr.includes('<html') ? `Fallback error ${upstream.status}` : fbErr.slice(0, 300);
             console.error('All backends failed:', upstream.status, cleanErr);
