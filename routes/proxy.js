@@ -655,7 +655,10 @@ router.use(async (req, res) => {
   // === Anthropic-native passthrough (default path) ===
   if (useAnthropicProxy) {
     const proxyModel = mapModelForProxy(claudeModel);
-    console.log(`  → proxy passthrough: ${claudeModel} → ${proxyModel}`);
+    // Modify only the model field — avoid full re-stringify if model unchanged
+    const fwdBody = proxyModel === claudeModel ? req.rawBody || JSON.stringify(body)
+      : JSON.stringify({ ...body, model: proxyModel });
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 55000);
     let upstream;
@@ -667,50 +670,34 @@ router.use(async (req, res) => {
           'x-api-key': ANTHROPIC_PROXY_KEY,
           'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
         },
-        body: JSON.stringify({ ...body, model: proxyModel }),
+        body: fwdBody,
         signal: controller.signal,
       });
     } catch (err) {
       clearTimeout(timer);
-      const msg = err.name === 'AbortError' ? 'Proxy timeout' : err.message;
-      return sendError(res, isStream, 502, msg, claudeModel);
+      return sendError(res, isStream, 502, err.name === 'AbortError' ? 'Proxy timeout' : err.message, claudeModel);
     }
     clearTimeout(timer);
 
     if (!upstream.ok) {
       const errText = await upstream.text();
       const cleanErr = errText.includes('<html') ? `Proxy error ${upstream.status}` : errText.slice(0, 300);
-      console.error(`Anthropic proxy ${upstream.status}:`, cleanErr);
+      console.error(`Proxy ${upstream.status}:`, cleanErr);
       return sendError(res, isStream, upstream.status, cleanErr, claudeModel);
     }
 
-    db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id);
+    // Fire-and-forget DB counter (don't block response)
+    setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
 
-    if (isStream) {
-      if (!res.headersSent) {
-        res.setHeader('content-type', 'text/event-stream');
-        res.setHeader('cache-control', 'no-cache');
-        res.setHeader('connection', 'keep-alive');
-        res.status(200);
-      }
-      req.on('close', () => { try { upstream.body.cancel(); } catch (_) {} });
-      const reader = upstream.body.getReader();
-      const pump = async () => {
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (!res.writableEnded) res.write(value);
-          }
-        } catch (_) {}
-        if (!res.writableEnded) res.end();
-      };
-      pump();
-    } else {
-      const json = await upstream.json();
-      logUsage(row.id, claudeModel, json.usage?.input_tokens || 0, json.usage?.output_tokens || 0);
-      res.status(200).json(json);
-    }
+    // Copy upstream headers and pipe bytes directly — no parsing
+    const ct = upstream.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
+    res.setHeader('content-type', ct);
+    if (isStream) { res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); }
+    res.status(upstream.status);
+
+    const { Readable } = require('stream');
+    req.on('close', () => { try { upstream.body.cancel(); } catch (_) {} });
+    Readable.fromWeb(upstream.body).pipe(res);
     return;
   }
 
