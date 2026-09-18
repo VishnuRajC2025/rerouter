@@ -45,5 +45,24 @@ if (!cols.includes('reset_interval_hours')) {
 if (!cols.includes('last_reset_at')) {
   db.exec(`ALTER TABLE tokens ADD COLUMN last_reset_at TEXT NOT NULL DEFAULT (datetime('now'))`);
 }
+if (!cols.includes('backend')) {
+  db.exec(`ALTER TABLE tokens ADD COLUMN backend TEXT DEFAULT NULL`);
+}
+
+// Auto-seed tokens from env on startup
+// SEED_TOKEN / SEED_TOKEN_NAME — primary token (default backend)
+// SEED_TOKEN_APMIX / SEED_TOKEN_APMIX_NAME — APMix backend token
+function seedToken(token, name, backend) {
+  if (!token) return;
+  const existing = db.prepare('SELECT id FROM tokens WHERE token = ?').get(token);
+  if (!existing) {
+    const { randomUUID } = require('crypto');
+    db.prepare(`INSERT INTO tokens (id, name, token, enabled, backend) VALUES (?, ?, ?, 1, ?)`)
+      .run(randomUUID(), name || 'default', token, backend || null);
+    console.log(`Seeded token '${name}' (backend: ${backend || 'default'})`);
+  }
+}
+seedToken(process.env.SEED_TOKEN, process.env.SEED_TOKEN_NAME, null);
+seedToken(process.env.SEED_TOKEN_APMIX, process.env.SEED_TOKEN_APMIX_NAME || 'apmix-client', 'apmix');
 
 module.exports = db;

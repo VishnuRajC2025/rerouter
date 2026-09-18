@@ -3,7 +3,18 @@ const db = require('../db');
 
 const router = express.Router();
 
+// Primary Anthropic-compatible proxy — requests forwarded as-is, no conversion
+const ANTHROPIC_PROXY_URL = (process.env.ANTHROPIC_PROXY_URL || 'https://proxy.nothingxd.shop').replace(/\/$/, '');
+const ANTHROPIC_PROXY_KEY = process.env.ANTHROPIC_PROXY_KEY || 'sk-ag-kBhWq9PMyJ-1K_GM_REnaJJChlEhPXZ-';
+
 const FREE_BASE = (process.env.FREE_BACKEND_URL || 'https://api.groq.com/openai/v1').replace(/\/$/, '');
+// Fallback backend (OpenAI-compatible) when primary fails
+const FALLBACK_URL = (process.env.FALLBACK_BACKEND_URL || '').replace(/\/$/, '');
+const FALLBACK_KEY = process.env.FALLBACK_BACKEND_KEY || '';
+
+// APMix backend — used when a token has backend='apmix'
+const APMIX_BASE = 'https://api.apmix.ai/v1';
+const APMIX_KEY  = process.env.APMIX_KEY || 'apx_live_b1NyVbz7YhuDIYohqcZ5Ri4DYCjPhdi4qUlxRQsf';
 
 // Global rate limit gate — holds requests when backend is rate limited
 const rateLimitGate = { blockedUntil: 0, releaseSlot: 0, queued: 0 };
@@ -54,61 +65,57 @@ async function waitForRateLimit(isStream, res, userId) {
   perUserQueued[userId] = Math.max(0, (perUserQueued[userId] || 1) - 1);
 }
 
-// Auto-refreshing token manager for Open WebUI
-const tokenCache = {
-  token: process.env.FREE_BACKEND_KEY || '',
-  expiresAt: 0,
-};
-
-// Parse JWT expiry without a library
-function jwtExpiry(token) {
-  try {
-    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
-    return (payload.exp || 0) * 1000;
-  } catch (_) { return 0; }
+async function getKey() {
+  return process.env.FREE_BACKEND_KEY || '';
 }
 
-async function getKey() {
-  const email = process.env.WEBUI_EMAIL;
-  const password = process.env.WEBUI_PASSWORD;
-  const loginUrl = process.env.WEBUI_LOGIN_URL || (FREE_BASE.replace(/\/api.*$/, '') + '/api/v1/auths/signin');
-
-  // If no auto-refresh creds, just return static key
-  if (!email || !password) return process.env.FREE_BACKEND_KEY || '';
-
-  // Refresh if token expires within 1 hour
-  const now = Date.now();
-  if (tokenCache.token && tokenCache.expiresAt > now + 3600_000) {
-    return tokenCache.token;
-  }
-
-  try {
-    const resp = await fetch(loginUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ email, password }),
-    });
-    if (!resp.ok) throw new Error(`Login failed: ${resp.status}`);
-    const data = await resp.json();
-    tokenCache.token = data.token;
-    tokenCache.expiresAt = jwtExpiry(data.token) || (now + 25 * 24 * 3600_000);
-    console.log('Token refreshed, expires:', new Date(tokenCache.expiresAt).toISOString());
-    return tokenCache.token;
-  } catch (err) {
-    console.error('Token refresh failed:', err.message);
-    return tokenCache.token; // fall back to cached
-  }
+// Map Claude model names → proxy.nothingxd.shop available models
+function mapModelForProxy(claudeModel) {
+  const m = (claudeModel || '').toLowerCase();
+  // Exact pass-through if already a known proxy model
+  const known = ['claude-opus-4-6-thinking','claude-sonnet-4-6','gemini-3.8-flash-tiered',
+    'gemini-3.7-flash-tiered','gemini-3.6-flash-tiered','gemini-3.6-flash-high',
+    'gemini-3.6-flash-medium','gemini-3.6-flash-low','gemini-3.5-flash-low',
+    'gemini-3.5-flash-lite','gemini-3.5-flash-extra-low'];
+  if (known.includes(claudeModel)) return claudeModel;
+  // Opus → best reasoning model
+  if (m.includes('opus')) return 'claude-opus-4-6-thinking';
+  // Sonnet / Fable → sonnet
+  if (m.includes('sonnet') || m.includes('fable')) return 'claude-sonnet-4-6';
+  // Haiku → fast Gemini
+  if (m.includes('haiku')) return 'gemini-3.8-flash-tiered';
+  // Gemini variants — pass through or map to tiered
+  if (m.includes('gemini')) return 'gemini-3.8-flash-tiered';
+  // Default
+  return 'claude-sonnet-4-6';
 }
 
 // Map Claude model names → backend model
-function mapModel(claudeModel) {
+function mapModel(claudeModel, base) {
+  const effectiveBase = base || FREE_BASE;
   if (!claudeModel) return 'claude-opus-5';
+  const isGroq = effectiveBase.includes('api.groq.com');
+  const isCodeCraft = effectiveBase.includes('codecraftapi.com');
+  const isApmix = effectiveBase.includes('api.apmix.ai');
   const m = claudeModel.toLowerCase();
-  if (m.includes('haiku')) return 'claude-fable-5';
-  if (m.includes('fable')) return 'claude-fable-5';
-  if (m.includes('sonnet')) return 'claude-sonnet-5';
-  return 'claude-opus-5';
+  if (isCodeCraft) {
+    if (m.includes('haiku')) return 'claude-sonnet-5';
+    if (m.includes('opus')) return 'claude-opus-5';
+    if (m.includes('fable')) return 'claude-fable-5';
+    if (m.includes('sonnet')) return 'claude-sonnet-5';
+    return 'claude-sonnet-5';
+  }
+  if (isApmix) {
+    return 'gpt-4.1-free';
+  }
+  if (isGroq) {
+    if (m.includes('haiku')) return 'qwen/qwen3.8-27b';
+    return 'openai/gpt-oss-120b';
+  }
+  if (m.includes('opus')) return 'nvidia/nemotron-3-ultra-550b-a55b:free';
+  return 'nvidia/nemotron-3-super-120b-a12b:free';
 }
+
 
 function extractToken(req) {
   const auth = req.headers['authorization'] || '';
@@ -145,10 +152,6 @@ function validateToken(raw) {
   return { row };
 }
 
-const TOOL_RESULT_LIMIT = 2000;        // chars — old tool results get capped at this
-const TOOL_RESULT_LIMIT_RECENT = 8000; // chars — recent tool results (last 10 msgs) capped here
-const RECENT_MSGS = 10;                // boundary between old and recent
-const MAX_TOOL_DESC_LENGTH = 500;      // chars — truncate long tool descriptions
 
 // Strip broken Unicode surrogates that cause "no low surrogate" JSON errors
 function sanitizeString(s) {
@@ -173,7 +176,6 @@ function toOpenAIMessages(system, messages) {
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
-    const isRecent = i >= messages.length - RECENT_MSGS;
 
     if (typeof msg.content === 'string') {
       result.push({ role: msg.role, content: sanitizeString(msg.content) });
@@ -190,13 +192,9 @@ function toOpenAIMessages(system, messages) {
 
     if (toolResultBlocks.length > 0) {
       for (const block of toolResultBlocks) {
-        let content = typeof block.content === 'string'
+        const content = typeof block.content === 'string'
           ? block.content
           : (Array.isArray(block.content) ? block.content.map(b => b.text || '').join('') : '');
-        const limit = isRecent ? TOOL_RESULT_LIMIT_RECENT : TOOL_RESULT_LIMIT;
-        if (content.length > limit) {
-          content = content.slice(0, limit) + '\n[...truncated]';
-        }
         result.push({ role: 'tool', tool_call_id: block.tool_use_id, content: sanitizeString(content) });
       }
       if (textBlocks.length > 0) {
@@ -216,7 +214,13 @@ function toOpenAIMessages(system, messages) {
       result.push({ role: msg.role, content: sanitizeString(textBlocks.map(b => b.text).join('')) });
     }
   }
-  return result;
+
+  // Remove orphaned tool messages — role='tool' with no matching assistant tool_calls before it
+  const validToolCallIds = new Set();
+  for (const m of result) {
+    if (m.tool_calls) m.tool_calls.forEach(tc => validToolCallIds.add(tc.id));
+  }
+  return result.filter(m => m.role !== 'tool' || validToolCallIds.has(m.tool_call_id));
 }
 
 // === Built-in tool execution (web_search, web_fetch) ===
@@ -305,15 +309,17 @@ async function execWebFetch(url) {
 }
 
 // Execute builtin tools in a loop until model returns a final text answer
-async function runToolLoop(messages, baseBody, builtinTools, claudeModel) {
+async function runToolLoop(messages, baseBody, builtinTools, claudeModel, effBase, effGetKey) {
   const MAX_ROUNDS = 5;
   let totalInputTokens = 0, totalOutputTokens = 0;
+  const backendBase = effBase || FREE_BASE;
+  const backendKey = effGetKey || getKey;
 
   for (let round = 0; round <= MAX_ROUNDS; round++) {
     const body = JSON.stringify({ ...baseBody, messages, stream: false });
-    const resp = await fetch(`${FREE_BASE}/chat/completions`, {
+    const resp = await fetch(`${backendBase}/chat/completions`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${await getKey()}` },
+      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${await backendKey()}` },
       body,
     });
     if (!resp.ok) {
@@ -365,6 +371,7 @@ async function runToolLoop(messages, baseBody, builtinTools, claudeModel) {
   }
 }
 
+
 // Emit a complete Anthropic response object as SSE events
 function emitAnthropicResponseAsStream(res, anthropicResp) {
   if (res.writableEnded) return;
@@ -402,20 +409,10 @@ function emitAnthropicResponseAsStream(res, anthropicResp) {
 // Convert Anthropic tools → OpenAI tools
 function toOpenAITools(tools) {
   if (!tools || !tools.length) return undefined;
-  return tools.map(t => {
-    let desc = t.description || '';
-    if (desc.length > MAX_TOOL_DESC_LENGTH) {
-      desc = desc.slice(0, MAX_TOOL_DESC_LENGTH) + '...';
-    }
-    return {
-      type: 'function',
-      function: {
-        name: t.name,
-        description: desc,
-        parameters: t.input_schema || { type: 'object', properties: {} },
-      },
-    };
-  });
+  return tools.map(t => ({
+    type: 'function',
+    function: { name: t.name, description: t.description || '', parameters: t.input_schema || { type: 'object', properties: {} } },
+  }));
 }
 
 // Convert OpenAI response → Anthropic response
@@ -591,30 +588,42 @@ function sendError(res, isStream, statusCode, message, claudeModel) {
   } catch (_) { try { res.end(); } catch (__) {} }
 }
 
+// Models list — no auth required so gateway discovery works
+router.use((req, res, next) => {
+  if (req.path === '/models' || req.path === '/models/') {
+    return res.json({
+      data: [
+        { type: 'model', id: 'claude-opus-4-6',    display_name: 'Claude Opus 4.6',   created_at: '2025-01-01T00:00:00Z' },
+        { type: 'model', id: 'claude-opus-4-5',     display_name: 'Claude Opus 4.5',   created_at: '2025-01-01T00:00:00Z' },
+        { type: 'model', id: 'claude-sonnet-4-6',   display_name: 'Claude Sonnet 4.6', created_at: '2025-01-01T00:00:00Z' },
+        { type: 'model', id: 'claude-sonnet-4-5',   display_name: 'Claude Sonnet 4.5', created_at: '2025-01-01T00:00:00Z' },
+        { type: 'model', id: 'claude-haiku-4-5',    display_name: 'Claude Haiku 4.5',  created_at: '2025-01-01T00:00:00Z' },
+        { type: 'model', id: 'claude-fable-5-1',    display_name: 'Claude Fable 5.1',  created_at: '2025-01-01T00:00:00Z' },
+        { type: 'model', id: 'claude-opus-5',       display_name: 'Claude Opus 5',     created_at: '2025-01-01T00:00:00Z' },
+        { type: 'model', id: 'claude-sonnet-5',     display_name: 'Claude Sonnet 5',   created_at: '2025-01-01T00:00:00Z' },
+      ],
+      has_more: false,
+    });
+  }
+  next();
+});
+
 router.use(async (req, res) => {
   const raw = extractToken(req);
   const { error, status, row } = validateToken(raw);
   if (error) return res.status(status).json({ error });
 
+  // Per-token backend override
+  const useApmix = row.backend === 'apmix';
+  const useOpenAI = row.backend === 'openai'; // explicit opt-in to OpenAI path
+  const useAnthropicProxy = !useApmix && !useOpenAI; // default: Anthropic passthrough
+  const effectiveBase = useApmix ? APMIX_BASE : FREE_BASE;
+  const effectiveGetKey = useApmix ? async () => APMIX_KEY : getKey;
+
   // Lightweight logging — estimate body size without serializing the whole thing
   const msgCount = req.body?.messages?.length || 0;
   const toolCount = req.body?.tools?.length || 0;
   console.log(`[${req.path}] model=${req.body?.model} msgs=${msgCount} tools=${toolCount}`);
-
-  // Models list — return fake Claude model list
-  if (req.path === '/models' || req.path === '/models/') {
-    return res.json({
-      data: [
-        { type: 'model', id: 'claude-opus-4-5',  display_name: 'Claude Opus',   created_at: '2025-01-01T00:00:00Z' },
-        { type: 'model', id: 'claude-sonnet-4-5', display_name: 'Claude Sonnet', created_at: '2025-01-01T00:00:00Z' },
-        { type: 'model', id: 'claude-haiku-4-5',  display_name: 'Claude Haiku',  created_at: '2025-01-01T00:00:00Z' },
-        { type: 'model', id: 'claude-fable-5-1',  display_name: 'Claude Fable',  created_at: '2025-01-01T00:00:00Z' },
-        { type: 'model', id: 'claude-opus-5',     display_name: 'Claude Opus 5', created_at: '2025-01-01T00:00:00Z' },
-        { type: 'model', id: 'claude-sonnet-5',   display_name: 'Claude Sonnet 5', created_at: '2025-01-01T00:00:00Z' },
-      ],
-      has_more: false,
-    });
-  }
 
   const body = req.body;
 
@@ -638,35 +647,85 @@ router.use(async (req, res) => {
   const claudeModel = body.model || 'claude-opus-4-5';
   const isStream = body.stream === true;
 
-  // Auto-truncate: keep last 40 messages when conversation gets too large
-  const MAX_MSGS = 40;
+  // Auto-truncate: keep last N messages, shrink further if payload still too large
   let msgs = body.messages || [];
-  if (msgs.length > MAX_MSGS) {
-    let kept = msgs.slice(-MAX_MSGS);
-    // Ensure slice starts at a user message — orphaned tool/assistant messages
-    // at the start cause OpenAI to reject the request with an invalid sequence error
-    while (kept.length > 0 && kept[0].role !== 'user') kept.shift();
-    if (kept.length === 0) kept = msgs.slice(-2); // fallback: keep last 2
-    kept.unshift({ role: 'user', content: '[Note: Earlier conversation history was auto-truncated to keep context manageable.]' });
-    kept.splice(1, 0, { role: 'assistant', content: 'Understood. I\'ll continue from the recent context.' });
-    msgs = kept;
-    console.log(`Auto-truncated: ${body.messages.length} → ${msgs.length} messages`);
+
+  const { userTools, builtinTools } = separateTools(body.tools);
+
+  // === Anthropic-native passthrough (default path) ===
+  if (useAnthropicProxy) {
+    const proxyModel = mapModelForProxy(claudeModel);
+    console.log(`  → proxy passthrough: ${claudeModel} → ${proxyModel}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 55000);
+    let upstream;
+    try {
+      upstream = await fetch(`${ANTHROPIC_PROXY_URL}/v1/messages`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': ANTHROPIC_PROXY_KEY,
+          'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
+        },
+        body: JSON.stringify({ ...body, model: proxyModel }),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      const msg = err.name === 'AbortError' ? 'Proxy timeout' : err.message;
+      return sendError(res, isStream, 502, msg, claudeModel);
+    }
+    clearTimeout(timer);
+
+    if (!upstream.ok) {
+      const errText = await upstream.text();
+      const cleanErr = errText.includes('<html') ? `Proxy error ${upstream.status}` : errText.slice(0, 300);
+      console.error(`Anthropic proxy ${upstream.status}:`, cleanErr);
+      return sendError(res, isStream, upstream.status, cleanErr, claudeModel);
+    }
+
+    db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id);
+
+    if (isStream) {
+      if (!res.headersSent) {
+        res.setHeader('content-type', 'text/event-stream');
+        res.setHeader('cache-control', 'no-cache');
+        res.setHeader('connection', 'keep-alive');
+        res.status(200);
+      }
+      req.on('close', () => { try { upstream.body.cancel(); } catch (_) {} });
+      const reader = upstream.body.getReader();
+      const pump = async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!res.writableEnded) res.write(value);
+          }
+        } catch (_) {}
+        if (!res.writableEnded) res.end();
+      };
+      pump();
+    } else {
+      const json = await upstream.json();
+      logUsage(row.id, claudeModel, json.usage?.input_tokens || 0, json.usage?.output_tokens || 0);
+      res.status(200).json(json);
+    }
+    return;
   }
 
+  // Build OpenAI body
   const openAIBody = {
-    model: mapModel(claudeModel),
+    model: mapModel(claudeModel, effectiveBase),
     messages: toOpenAIMessages(body.system, msgs),
-    max_tokens: body.max_tokens || 4096,
+    max_tokens: effectiveBase.includes('api.groq.com') ? Math.min(body.max_tokens || 4096, 8192) : (body.max_tokens || 4096),
     stream: isStream,
   };
   if (body.temperature !== undefined) openAIBody.temperature = body.temperature;
   if (body.top_p !== undefined) openAIBody.top_p = body.top_p;
-  const { userTools, builtinTools } = separateTools(body.tools);
   const openAITools = toOpenAITools(userTools);
   if (openAITools) openAIBody.tools = openAITools;
   if (isStream) openAIBody.stream_options = { include_usage: true };
-
-  // Log actual forwarded body size (after truncation)
   const fwdBody = JSON.stringify(openAIBody);
   const fwdKB = (Buffer.byteLength(fwdBody, 'utf8') / 1024).toFixed(1);
   console.log(`  → forwarding: model=${openAIBody.model} msgs=${openAIBody.messages.length} tools=${openAIBody.tools?.length || 0} fwdSize=${fwdKB}KB`);
@@ -692,7 +751,7 @@ router.use(async (req, res) => {
         catch (_) { clearInterval(keepAlive); }
       }, 5000) : null;
       try {
-        const anthropicResp = await runToolLoop(openAIBody.messages, openAIBody, builtinTools, claudeModel);
+        const anthropicResp = await runToolLoop(openAIBody.messages, openAIBody, builtinTools, claudeModel, effectiveBase, effectiveGetKey);
         if (keepAlive) clearInterval(keepAlive);
         db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id);
         logUsage(row.id, claudeModel, anthropicResp.usage?.input_tokens || 0, anthropicResp.usage?.output_tokens || 0);
@@ -709,25 +768,67 @@ router.use(async (req, res) => {
       return;
     }
 
+    // === OpenAI-format backend ===
     async function fetchUpstream() {
-      return fetch(`${FREE_BASE}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'authorization': `Bearer ${await getKey()}`,
-        },
-        body: fwdBody,
-      });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 55000);
+      try {
+        return await fetch(`${effectiveBase}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'authorization': `Bearer ${await effectiveGetKey()}`,
+          },
+          body: fwdBody,
+          signal: controller.signal,
+        });
+      } catch (err) {
+        if (err.name === 'AbortError') {
+          return new Response(null, { status: 502, statusText: 'Gateway Timeout' });
+        }
+        throw err;
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
     let upstream = await fetchUpstream();
 
     if (!upstream.ok) {
       const errText = await upstream.text();
+      console.error(`Upstream ${upstream.status} body: ${errText.slice(0, 300) || '(empty)'}`);
       const isRateLimit = upstream.status === 429 || (upstream.status === 400 && errText.includes('RateLimitError'));
       const isTimeout = upstream.status === 524 || upstream.status === 504 || upstream.status === 502 || upstream.status === 503;
+      const isQuota = upstream.status === 402 || errText.includes('insufficient_quota') || errText.includes('insufficient_funds') || errText.includes('insufficient_balance') || errText.includes('usage limit');
 
-      if (isRateLimit) {
+      // Try fallback key when primary is quota-exhausted or rate-limited
+      if (FALLBACK_URL && (isQuota || isRateLimit || isTimeout)) {
+        console.log(`Primary OpenAI backend failed (${upstream.status}) — falling back to ${FALLBACK_URL}`);
+        const fbModel = 'groq/compound';
+        const fbBody = { ...openAIBody, model: fbModel, max_tokens: Math.min(openAIBody.max_tokens || 4096, 8192), tools: undefined, tool_choice: undefined };
+        upstream = await fetch(`${FALLBACK_URL}/chat/completions`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'authorization': `Bearer ${FALLBACK_KEY}` },
+          body: JSON.stringify(fbBody),
+        });
+        if (!upstream.ok) {
+          if (upstream.status === 429) {
+            console.log('Fallback rate limited — retrying in 10s...');
+            await new Promise(r => setTimeout(r, 10000));
+            upstream = await fetch(`${FALLBACK_URL}/chat/completions`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', 'authorization': `Bearer ${FALLBACK_KEY}` },
+              body: JSON.stringify(fbBody),
+            });
+          }
+          if (!upstream.ok) {
+            const fbErr = await upstream.text();
+            const cleanErr = fbErr.includes('<html') ? `Fallback error ${upstream.status}` : fbErr.slice(0, 300);
+            console.error('Fallback also failed:', upstream.status, cleanErr);
+            return sendError(res, isStream, upstream.status, cleanErr, claudeModel);
+          }
+        }
+      } else if (isRateLimit) {
         rateLimitGate.blockedUntil = Date.now() + 65_000;
         console.log('Rate limit hit — global gate set for 65s');
         await waitForRateLimit(isStream, res, row.id);
@@ -739,13 +840,12 @@ router.use(async (req, res) => {
           return sendError(res, isStream, upstream.status, cleanRetryErr, claudeModel);
         }
       } else if (isTimeout) {
-        // Backend timeout — wait 8s and retry once before giving up
-        console.log(`Backend timeout ${upstream.status} — retrying in 8s...`);
-        await new Promise(r => setTimeout(r, 8000));
+        console.log(`Backend timeout ${upstream.status} — retrying once in 5s...`);
+        await new Promise(r => setTimeout(r, 5000));
         upstream = await fetchUpstream();
         if (!upstream.ok) {
           const retryText = await upstream.text();
-          const cleanErr = retryText.includes('<html') ? `Backend timeout (${upstream.status}) — please retry your message` : retryText.slice(0, 300);
+          const cleanErr = retryText.includes('<html') ? `Backend timeout — please retry your message` : retryText.slice(0, 300);
           console.error('Upstream timeout after retry:', upstream.status);
           return sendError(res, isStream, 503, cleanErr, claudeModel);
         }
@@ -775,7 +875,6 @@ router.use(async (req, res) => {
       const decoder = new TextDecoder();
       const state = { claudeModel, started: false };
 
-      // Abort upstream reader if client disconnects
       req.on('close', () => {
         try { reader.cancel(); } catch (_) {}
       });
@@ -795,13 +894,16 @@ router.use(async (req, res) => {
               if (payload === '[DONE]') continue;
               let chunk;
               try { chunk = JSON.parse(payload); } catch (_) { continue; }
+              if (chunk.error && !chunk.choices) {
+                console.error('Provider SSE error:', chunk.error?.message || JSON.stringify(chunk.error).slice(0, 100));
+                continue; // skip error chunks, let stream finish naturally
+              }
               for (const event of toAnthropicEvents(chunk, state)) {
                 if (res.writableEnded) break;
                 res.write(event);
               }
             }
           }
-          // Process any remaining data in buffer after stream ends
           if (buffer.trim().startsWith('data: ')) {
             const payload = buffer.trim().slice(6).trim();
             if (payload && payload !== '[DONE]') {
@@ -815,7 +917,6 @@ router.use(async (req, res) => {
             }
           }
           clearInterval(keepAlive);
-          // If stream ended but we never emitted message_stop, emit it now
           if (!state.done && !res.writableEnded) {
             if (state.started) {
               if (state.blockOpen) {
@@ -849,7 +950,15 @@ router.use(async (req, res) => {
       };
       pump().catch(err => console.error('Unhandled pump error:', err.message));
     } else {
-      const data = await upstream.json();
+      const rawText = await upstream.text();
+      let data;
+      try { data = JSON.parse(rawText); } catch(e) { console.error('JSON parse error:', rawText.slice(0, 300)); throw e; }
+      console.log('Backend response content:', (JSON.stringify(data?.choices?.[0]?.message) || '(none)').slice(0, 200));
+      if (data.error && !data.choices) {
+        const errMsg = data.error?.message || JSON.stringify(data.error);
+        console.error('Provider error (200 with error body):', errMsg);
+        return sendError(res, isStream, 502, errMsg, claudeModel);
+      }
       const anthropicResp = toAnthropicResponse(data, claudeModel);
       res.status(200).json(anthropicResp);
       logUsage(row.id, claudeModel, anthropicResp.usage.input_tokens, anthropicResp.usage.output_tokens);
