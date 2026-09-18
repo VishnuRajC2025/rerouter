@@ -69,23 +69,19 @@ async function getKey() {
   return process.env.FREE_BACKEND_KEY || '';
 }
 
-// Map Claude model names → proxy.nothingxd.shop available models
+// Map Claude model names → primary proxy available models
 function mapModelForProxy(claudeModel) {
   const m = (claudeModel || '').toLowerCase();
-  // Exact pass-through if already a known proxy model
-  const known = ['claude-opus-4-6-thinking','claude-sonnet-4-6','gemini-3.8-flash-tiered',
-    'gemini-3.7-flash-tiered','gemini-3.6-flash-tiered','gemini-3.6-flash-high',
-    'gemini-3.6-flash-medium','gemini-3.6-flash-low','gemini-3.5-flash-low',
-    'gemini-3.5-flash-lite','gemini-3.5-flash-extra-low'];
+  // Exact pass-through if already a known vyceai model
+  const known = ['claude-sonnet-4-6','deepseek-v4-flash','deepseek-v4.1',
+    'deepseek-v4-flash-lr','agnes-3.0-flash','grok-imagine-2'];
   if (known.includes(claudeModel)) return claudeModel;
-  // Opus → best reasoning model
-  if (m.includes('opus')) return 'claude-opus-4-6-thinking';
-  // Sonnet / Fable → sonnet
-  if (m.includes('sonnet') || m.includes('fable')) return 'claude-sonnet-4-6';
-  // Haiku → fast Gemini
-  if (m.includes('haiku')) return 'gemini-3.8-flash-tiered';
-  // Gemini variants — pass through or map to tiered
-  if (m.includes('gemini')) return 'gemini-3.8-flash-tiered';
+  // Opus / Sonnet / Fable → best Claude available
+  if (m.includes('opus') || m.includes('sonnet') || m.includes('fable')) return 'claude-sonnet-4-6';
+  // Haiku → fastest model
+  if (m.includes('haiku')) return 'agnes-3.0-flash';
+  // DeepSeek passthrough
+  if (m.includes('deepseek')) return 'deepseek-v4-flash';
   // Default
   return 'claude-sonnet-4-6';
 }
