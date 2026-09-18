@@ -677,24 +677,31 @@ router.use(async (req, res) => {
 
     if (!upstream.ok) {
       const errText = await upstream.text();
-      const cleanErr = errText.includes('<html') ? `Proxy error ${upstream.status}` : errText.slice(0, 300);
-      console.error(`Proxy ${upstream.status}:`, cleanErr);
-      return sendError(res, isStream, upstream.status, cleanErr, claudeModel);
+      const isCreditsOut = upstream.status === 402 ||
+        /credit|quota|balance|exhausted|billing|payment|limit reached/i.test(errText);
+      if (isCreditsOut && FREE_BASE && FALLBACK_URL === '' ) {
+        console.warn(`Primary proxy credits exhausted (${upstream.status}) — falling back to CodeCraft`);
+        // fall through to OpenAI path below
+      } else {
+        const cleanErr = errText.includes('<html') ? `Proxy error ${upstream.status}` : errText.slice(0, 300);
+        console.error(`Proxy ${upstream.status}:`, cleanErr);
+        return sendError(res, isStream, upstream.status, cleanErr, claudeModel);
+      }
+    } else {
+      // Fire-and-forget DB counter (don't block response)
+      setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
+
+      // Copy upstream headers and pipe bytes directly — no parsing
+      const ct = upstream.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
+      res.setHeader('content-type', ct);
+      if (isStream) { res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); }
+      res.status(upstream.status);
+
+      const { Readable } = require('stream');
+      req.on('close', () => { try { upstream.body.cancel(); } catch (_) {} });
+      Readable.fromWeb(upstream.body).pipe(res);
+      return;
     }
-
-    // Fire-and-forget DB counter (don't block response)
-    setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
-
-    // Copy upstream headers and pipe bytes directly — no parsing
-    const ct = upstream.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
-    res.setHeader('content-type', ct);
-    if (isStream) { res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); }
-    res.status(upstream.status);
-
-    const { Readable } = require('stream');
-    req.on('close', () => { try { upstream.body.cancel(); } catch (_) {} });
-    Readable.fromWeb(upstream.body).pipe(res);
-    return;
   }
 
   // Build OpenAI body
