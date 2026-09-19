@@ -234,6 +234,7 @@ function renderRow(t) {
     <td>
       <div class="actions">
         <button class="btn btn-sm btn-download" onclick="downloadScript('${t.id}', '${esc(t.name)}')">Script</button>
+        <button class="btn btn-sm btn-neutral" onclick="downloadJson('${esc(t.token)}', '${esc(t.name)}')">JSON</button>
         ${toggleBtn}
         <button class="btn btn-sm btn-danger" onclick="deleteToken('${t.id}', '${esc(t.name)}')">Delete</button>
       </div>
@@ -293,6 +294,25 @@ async function downloadScript(id, name) {
 function copyScript() {
   const text = document.getElementById('modalScript').textContent;
   navigator.clipboard.writeText(text).then(() => toast('Script copied to clipboard'));
+}
+
+function downloadJson(token, name) {
+  const config = {
+    inferenceProvider: "gateway",
+    inferenceCredentialKind: "static",
+    inferenceGatewayBaseUrl: BASE || window.location.origin,
+    inferenceGatewayApiKey: token,
+    inferenceGatewayAuthScheme: "bearer",
+    modelDiscoveryEnabled: true
+  };
+  const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `claude-config-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  toast('Config JSON downloaded');
 }
 
 function closeModal(e) {
