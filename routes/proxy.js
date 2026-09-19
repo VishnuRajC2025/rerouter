@@ -91,14 +91,19 @@ async function getKey() {
   return process.env.FREE_BACKEND_KEY || '';
 }
 
-// Map Claude model names → 9Router/Antigravity models
+// Map Claude model names → 9Router Claude models (primary)
 function mapModelForNineRouter(claudeModel) {
   const m = (claudeModel || '').toLowerCase();
   if (m.includes('opus')) return 'ag/claude-opus-4-6-thinking';
-  if (m.includes('sonnet') || m.includes('fable')) return 'ag/claude-sonnet-4-6';
-  if (m.includes('haiku')) return 'ag/gemini-3.8-flash-low';
   if (m.includes('gemini')) return `ag/${claudeModel}`;
-  return 'ag/claude-sonnet-4-6';
+  return 'ag/claude-sonnet-4-6'; // sonnet, fable, haiku all → claude-sonnet-4-6
+}
+
+// Map Claude model names → 9Router Gemini fallback (when Claude limit hit)
+function mapModelForNineRouterGemini(claudeModel) {
+  const m = (claudeModel || '').toLowerCase();
+  if (m.includes('haiku')) return 'ag/gemini-3.8-flash-low';
+  return 'ag/gemini-3.8-flash-high'; // opus, sonnet, fable → best gemini
 }
 
 // Map Claude model names → OpenRouter DeepSeek models
@@ -726,7 +731,8 @@ router.use(async (req, res) => {
       return;
     }
     if (nrResp && !nrResp.ok) {
-      console.warn(`9Router Claude failed (${nrResp.status}) — trying 9Router Gemini`);
+      const geminiModel = mapModelForNineRouterGemini(claudeModel);
+      console.warn(`9Router Claude failed (${nrResp.status}) — trying 9Router Gemini (${geminiModel})`);
       // === Tier 0b: 9Router Gemini (Claude limit hit — fallback within Antigravity) ===
       let nrGeminiResp = null;
       try {
@@ -737,14 +743,14 @@ router.use(async (req, res) => {
             'x-api-key': NINEROUTER_KEY,
             'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
           },
-          body: JSON.stringify({ ...body, model: 'ag/gemini-3.8-flash-high' }),
+          body: JSON.stringify({ ...body, model: geminiModel }),
           signal: AbortSignal.timeout(55000),
         });
       } catch (e) {
         console.warn(`9Router Gemini error (${e.name}) — falling through to OpenRouter`);
       }
       if (nrGeminiResp && nrGeminiResp.ok) {
-        console.log('  → 9Router Gemini OK (ag/gemini-3.8-flash-high)');
+        console.log(`  → 9Router Gemini OK (${geminiModel})`);
         setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
         const ct = nrGeminiResp.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
         res.setHeader('content-type', ct);
