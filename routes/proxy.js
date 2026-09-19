@@ -85,7 +85,9 @@ async function getKey() {
 function mapModelForNineRouter(claudeModel) {
   const m = (claudeModel || '').toLowerCase();
   if (m.includes('opus')) return 'ag/claude-opus-4-6-thinking';
+  if (m.includes('sonnet') || m.includes('fable')) return 'ag/claude-sonnet-4-6';
   if (m.includes('haiku')) return 'ag/gemini-3.8-flash-low';
+  if (m.includes('gemini')) return `ag/${claudeModel}`;
   return 'ag/claude-sonnet-4-6';
 }
 
