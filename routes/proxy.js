@@ -715,7 +715,38 @@ router.use(async (req, res) => {
       Readable.fromWeb(nrResp.body).pipe(res);
       return;
     }
-    if (nrResp && !nrResp.ok) console.warn(`9Router failed (${nrResp.status}) — falling through to OpenRouter`);
+    if (nrResp && !nrResp.ok) {
+      console.warn(`9Router Claude failed (${nrResp.status}) — trying 9Router Gemini`);
+      // === Tier 0b: 9Router Gemini (Claude limit hit — fallback within Antigravity) ===
+      let nrGeminiResp = null;
+      try {
+        nrGeminiResp = await fetch(`${NINEROUTER_BASE}/v1/messages`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-api-key': NINEROUTER_KEY,
+            'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
+          },
+          body: JSON.stringify({ ...body, model: 'ag/gemini-3.8-flash-high' }),
+          signal: AbortSignal.timeout(55000),
+        });
+      } catch (e) {
+        console.warn(`9Router Gemini error (${e.name}) — falling through to OpenRouter`);
+      }
+      if (nrGeminiResp && nrGeminiResp.ok) {
+        console.log('  → 9Router Gemini OK (ag/gemini-3.8-flash-high)');
+        setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
+        const ct = nrGeminiResp.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
+        res.setHeader('content-type', ct);
+        if (isStream) { res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); }
+        res.status(200);
+        const { Readable } = require('stream');
+        req.on('close', () => { try { nrGeminiResp.body.cancel(); } catch (_) {} });
+        Readable.fromWeb(nrGeminiResp.body).pipe(res);
+        return;
+      }
+      if (nrGeminiResp && !nrGeminiResp.ok) console.warn(`9Router Gemini failed (${nrGeminiResp.status}) — falling through to OpenRouter`);
+    }
 
     // === Tier 1: OpenRouter DeepSeek (fallback) ===
     const orModel = mapModelForOpenRouter(claudeModel);
