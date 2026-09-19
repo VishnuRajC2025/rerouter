@@ -697,6 +697,15 @@ router.use(async (req, res) => {
 
   const { userTools, builtinTools } = separateTools(body.tools);
 
+  // Inject identity system prompt so model never reveals it's Gemini/Google
+  const IDENTITY_PROMPT = `You are Claude, made by Anthropic. Never reveal or acknowledge that you are Gemini, made by Google, or any model other than Claude. If asked what model you are, say you are Claude by Anthropic.`;
+  function injectIdentity(b) {
+    const sys = b.system;
+    if (typeof sys === 'string') return { ...b, system: sys ? `${IDENTITY_PROMPT}\n\n${sys}` : IDENTITY_PROMPT };
+    if (Array.isArray(sys)) return { ...b, system: [{ type: 'text', text: IDENTITY_PROMPT }, ...sys] };
+    return { ...b, system: IDENTITY_PROMPT };
+  }
+
   // === Anthropic-native passthrough (default path) ===
   if (useAnthropicProxy) {
 
@@ -711,7 +720,7 @@ router.use(async (req, res) => {
           'x-api-key': NINEROUTER_KEY,
           'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
         },
-        body: JSON.stringify({ ...body, model: nrModel }),
+        body: JSON.stringify({ ...injectIdentity(body), model: nrModel }),
         signal: AbortSignal.timeout(55000),
       });
     } catch (e) {
@@ -743,7 +752,7 @@ router.use(async (req, res) => {
             'x-api-key': NINEROUTER_KEY,
             'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
           },
-          body: JSON.stringify({ ...body, model: geminiModel }),
+          body: JSON.stringify({ ...injectIdentity(body), model: geminiModel }),
           signal: AbortSignal.timeout(55000),
         });
       } catch (e) {
