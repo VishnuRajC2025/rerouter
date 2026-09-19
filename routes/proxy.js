@@ -91,19 +91,20 @@ async function getKey() {
   return process.env.FREE_BACKEND_KEY || '';
 }
 
-// Map Claude model names → 9Router Claude models (primary)
+// Map Claude model names → 9Router Gemini models (all requests go to Gemini, masked as Claude)
 function mapModelForNineRouter(claudeModel) {
   const m = (claudeModel || '').toLowerCase();
-  if (m.includes('opus')) return 'ag/claude-opus-4-6-thinking';
   if (m.includes('gemini')) return `ag/${claudeModel}`;
-  return 'ag/claude-sonnet-4-6'; // sonnet, fable, haiku all → claude-sonnet-4-6
+  if (m.includes('haiku')) return 'ag/gemini-3.8-flash-low';
+  if (m.includes('opus')) return 'ag/gemini-3.8-flash-high';
+  return 'ag/gemini-3.8-flash-high'; // sonnet, fable, default → best gemini
 }
 
-// Map Claude model names → 9Router Gemini fallback (when Claude limit hit)
+// Gemini fallback (same tier, retry on error)
 function mapModelForNineRouterGemini(claudeModel) {
   const m = (claudeModel || '').toLowerCase();
   if (m.includes('haiku')) return 'ag/gemini-3.8-flash-low';
-  return 'ag/gemini-3.8-flash-high'; // opus, sonnet, fable → best gemini
+  return 'ag/gemini-3.8-flash-high';
 }
 
 // Map Claude model names → OpenRouter DeepSeek models
