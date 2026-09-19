@@ -3,9 +3,21 @@ const db = require('../db');
 
 const router = express.Router();
 
-// Primary Anthropic-compatible proxy — requests forwarded as-is, no conversion
+// Tier 0: 9Router/Antigravity (primary — Anthropic-native, 1M context, Google Pro)
+const NINEROUTER_BASE = (process.env.NINEROUTER_BASE || '').replace(/\/$/, '');
+const NINEROUTER_KEY = process.env.NINEROUTER_KEY || '';
+
+// Tier 1: OpenRouter DeepSeek (fallback — free, best coding, 1M context)
+const OPENROUTER_KEY = process.env.OPENROUTER_KEY || '';
+const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
+
+// Tier 2: Google AI (fallback)
+const GOOGLE_AI_KEY = process.env.GOOGLE_AI_KEY || '';
+const GOOGLE_AI_BASE = 'https://generativelanguage.googleapis.com/v1beta/openai';
+
+// Tier 3: nothingxd Anthropic-native proxy (fallback when Google AI fails)
 const ANTHROPIC_PROXY_URL = (process.env.ANTHROPIC_PROXY_URL || 'https://proxy.nothingxd.shop').replace(/\/$/, '');
-const ANTHROPIC_PROXY_KEY = process.env.ANTHROPIC_PROXY_KEY || 'sk-ag-kBhWq9PMyJ-1K_GM_REnaJJChlEhPXZ-';
+const ANTHROPIC_PROXY_KEY = process.env.ANTHROPIC_PROXY_KEY || '';
 
 const FREE_BASE = (process.env.FREE_BACKEND_URL || 'https://api.groq.com/openai/v1').replace(/\/$/, '');
 // Fallback backend (OpenAI-compatible) when primary fails
@@ -69,20 +81,35 @@ async function getKey() {
   return process.env.FREE_BACKEND_KEY || '';
 }
 
-// Map Claude model names → primary proxy available models
+// Map Claude model names → 9Router/Antigravity models
+function mapModelForNineRouter(claudeModel) {
+  const m = (claudeModel || '').toLowerCase();
+  if (m.includes('opus')) return 'ag/claude-opus-4-6-thinking';
+  if (m.includes('haiku')) return 'ag/gemini-3.8-flash-low';
+  return 'ag/claude-sonnet-4-6';
+}
+
+// Map Claude model names → OpenRouter DeepSeek models
+function mapModelForOpenRouter(claudeModel) {
+  const m = (claudeModel || '').toLowerCase();
+  if (m.includes('opus')) return 'nvidia/nemotron-3-ultra-550b-a55b:free';
+  return 'deepseek/deepseek-v4-flash-0731:free';
+}
+
+// Map Claude model names → Google AI models
+function mapModelForGoogle(claudeModel) {
+  const m = (claudeModel || '').toLowerCase();
+  if (m.includes('opus')) return 'gemini-3.6-flash';
+  return 'gemini-3.5-flash-lite';
+}
+
+// Map Claude model names → nothingxd available models
 function mapModelForProxy(claudeModel) {
   const m = (claudeModel || '').toLowerCase();
-  // Exact pass-through if already a known vyceai model
-  const known = ['claude-sonnet-4-6','deepseek-v4-flash','deepseek-v4.1',
-    'deepseek-v4-flash-lr','agnes-3.0-flash','grok-imagine-2'];
-  if (known.includes(claudeModel)) return claudeModel;
-  // Opus / Sonnet / Fable → best Claude available
-  if (m.includes('opus') || m.includes('sonnet') || m.includes('fable')) return 'claude-sonnet-4-6';
-  // Haiku → fastest model
-  if (m.includes('haiku')) return 'agnes-3.0-flash';
-  // DeepSeek passthrough
-  if (m.includes('deepseek')) return 'deepseek-v4-flash';
-  // Default
+  if (m.includes('opus')) return 'claude-opus-4-6-thinking';
+  if (m.includes('sonnet') || m.includes('fable')) return 'claude-sonnet-4-6';
+  if (m.includes('haiku')) return 'gemini-3.5-flash-lite';
+  if (m.includes('gemini')) return claudeModel;
   return 'claude-sonnet-4-6';
 }
 
@@ -417,7 +444,9 @@ function toAnthropicResponse(data, claudeModel) {
   const message = choice?.message || {};
   const content = [];
 
-  if (message.content) content.push({ type: 'text', text: message.content });
+  // DeepSeek reasoning models put response in `reasoning` when `content` is null
+  const textContent = message.content || message.reasoning || '';
+  if (textContent) content.push({ type: 'text', text: textContent });
   if (message.tool_calls) {
     for (const tc of message.tool_calls) {
       let input = {};
@@ -480,6 +509,8 @@ function* toAnthropicEvents(chunk, state) {
     })}\n\n`;
     yield `event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`;
 
+    // DeepSeek: fall back to reasoning when content is null
+    if (!delta.content && delta.reasoning) delta.content = delta.reasoning;
     if (delta.content !== undefined && delta.content !== null && delta.content !== '') {
       yield `event: content_block_start\ndata: ${JSON.stringify({
         type: 'content_block_start', index: 0,
@@ -490,6 +521,7 @@ function* toAnthropicEvents(chunk, state) {
     }
   }
 
+  if (!delta.content && delta.reasoning) delta.content = delta.reasoning;
   if (delta.content) {
     // If a tool_use block is currently open, close it before opening a text block
     if (state.blockOpen && state.blockType === 'tool_use') {
@@ -650,6 +682,181 @@ router.use(async (req, res) => {
 
   // === Anthropic-native passthrough (default path) ===
   if (useAnthropicProxy) {
+
+    // === Tier 0: 9Router/Antigravity (primary — Anthropic-native) ===
+    const nrModel = mapModelForNineRouter(claudeModel);
+    let nrResp = null;
+    try {
+      nrResp = await fetch(`${NINEROUTER_BASE}/v1/messages`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': NINEROUTER_KEY,
+          'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
+        },
+        body: JSON.stringify({ ...body, model: nrModel }),
+        signal: AbortSignal.timeout(55000),
+      });
+    } catch (e) {
+      console.warn(`9Router error (${e.name}) — falling through to OpenRouter`);
+    }
+
+    if (nrResp && nrResp.ok) {
+      console.log(`  → 9Router OK (${nrModel})`);
+      setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
+      const ct = nrResp.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
+      res.setHeader('content-type', ct);
+      if (isStream) { res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); }
+      res.status(200);
+      const { Readable } = require('stream');
+      req.on('close', () => { try { nrResp.body.cancel(); } catch (_) {} });
+      Readable.fromWeb(nrResp.body).pipe(res);
+      return;
+    }
+    if (nrResp && !nrResp.ok) console.warn(`9Router failed (${nrResp.status}) — falling through to OpenRouter`);
+
+    // === Tier 1: OpenRouter DeepSeek (fallback) ===
+    const orModel = mapModelForOpenRouter(claudeModel);
+    const orBody = {
+      model: orModel,
+      messages: toOpenAIMessages(body.system, msgs),
+      max_tokens: body.max_tokens || 8192,
+      stream: isStream,
+      ...(isStream && { stream_options: { include_usage: true } }),
+    };
+    if (body.temperature !== undefined) orBody.temperature = body.temperature;
+    if (body.tools) { const t = toOpenAITools(body.tools); if (t) orBody.tools = t; }
+    let orResp = null;
+    try {
+      orResp = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'authorization': `Bearer ${OPENROUTER_KEY}` },
+        body: JSON.stringify(orBody),
+        signal: AbortSignal.timeout(55000),
+      });
+    } catch (e) {
+      console.warn(`OpenRouter error (${e.name}) — falling through to Google AI`);
+    }
+
+    if (orResp && orResp.ok) {
+      console.log(`  → OpenRouter OK (${orModel})`);
+      setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
+      if (isStream) {
+        if (!res.headersSent) { res.setHeader('content-type','text/event-stream'); res.setHeader('cache-control','no-cache'); res.setHeader('connection','keep-alive'); res.status(200); }
+        const keepAlive = setInterval(() => { try { if (!res.writableEnded) res.write(': ping\n\n'); } catch (_) { clearInterval(keepAlive); } }, 5000);
+        const reader = orResp.body.getReader(); const decoder = new TextDecoder(); const state = { claudeModel };
+        req.on('close', () => { try { reader.cancel(); } catch (_) {} });
+        let buf = '';
+        try {
+          while (true) {
+            const { done, value } = await reader.read(); if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            const lines = buf.split('\n'); buf = lines.pop();
+            for (const line of lines) {
+              if (!line.startsWith('data: ')) continue;
+              const payload = line.slice(6).trim(); if (payload === '[DONE]') continue;
+              let chunk; try { chunk = JSON.parse(payload); } catch (_) { continue; }
+              for (const event of toAnthropicEvents(chunk, state)) { if (!res.writableEnded) res.write(event); }
+            }
+          }
+          clearInterval(keepAlive);
+          if (!state.done && !res.writableEnded) {
+            if (state.blockOpen) res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type:'content_block_stop', index:state.blockIndex })}\n\n`);
+            res.write(`event: message_delta\ndata: ${JSON.stringify({ type:'message_delta', delta:{stop_reason:'end_turn'}, usage:{output_tokens:state.outputTokens||0} })}\n\n`);
+            res.write(`event: message_stop\ndata: ${JSON.stringify({ type:'message_stop' })}\n\n`);
+          }
+          res.end(); logUsage(row.id, claudeModel, state.finalInputTokens||0, state.finalOutputTokens||0);
+        } catch (e) { clearInterval(keepAlive); try { if (!res.writableEnded) res.end(); } catch (_) {} }
+        return;
+      } else {
+        const data = await orResp.json();
+        const anthropicResp = toAnthropicResponse(data, claudeModel);
+        res.status(200).json(anthropicResp);
+        logUsage(row.id, claudeModel, anthropicResp.usage.input_tokens, anthropicResp.usage.output_tokens);
+        return;
+      }
+    }
+    if (orResp && !orResp.ok) console.warn(`OpenRouter failed (${orResp.status}) — falling through to Google AI`);
+
+    // === Tier 1: Google AI ===
+    const googleModel = mapModelForGoogle(claudeModel);
+    const googleOpenAIBody = {
+      model: googleModel,
+      messages: toOpenAIMessages(body.system, msgs),
+      max_tokens: body.max_tokens || 8192,
+      stream: isStream,
+      ...(isStream && { stream_options: { include_usage: true } }),
+    };
+    if (body.temperature !== undefined) googleOpenAIBody.temperature = body.temperature;
+    let googleResp = null;
+    try {
+      googleResp = await fetch(`${GOOGLE_AI_BASE}/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'authorization': `Bearer ${GOOGLE_AI_KEY}` },
+        body: JSON.stringify(googleOpenAIBody),
+        signal: AbortSignal.timeout(55000),
+      });
+    } catch (e) {
+      console.warn(`Google AI error (${e.name}) — falling through to nothingxd`);
+    }
+
+    if (googleResp && googleResp.ok) {
+      console.log(`  → Google AI OK (${googleModel})`);
+      setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
+      if (isStream) {
+        if (!res.headersSent) {
+          res.setHeader('content-type', 'text/event-stream');
+          res.setHeader('cache-control', 'no-cache');
+          res.setHeader('connection', 'keep-alive');
+          res.status(200);
+        }
+        const keepAlive = setInterval(() => { try { if (!res.writableEnded) res.write(': ping\n\n'); } catch (_) { clearInterval(keepAlive); } }, 5000);
+        const reader = googleResp.body.getReader();
+        const decoder = new TextDecoder();
+        const state = { claudeModel };
+        req.on('close', () => { try { reader.cancel(); } catch (_) {} });
+        let buf = '';
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            const lines = buf.split('\n'); buf = lines.pop();
+            for (const line of lines) {
+              if (!line.startsWith('data: ')) continue;
+              const payload = line.slice(6).trim();
+              if (payload === '[DONE]') continue;
+              let chunk; try { chunk = JSON.parse(payload); } catch (_) { continue; }
+              for (const event of toAnthropicEvents(chunk, state)) { if (!res.writableEnded) res.write(event); }
+            }
+          }
+          clearInterval(keepAlive);
+          if (!state.done && !res.writableEnded) {
+            if (state.blockOpen) res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: state.blockIndex })}\n\n`);
+            res.write(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: state.outputTokens || 0 } })}\n\n`);
+            res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+          }
+          res.end();
+          logUsage(row.id, claudeModel, state.finalInputTokens || 0, state.finalOutputTokens || 0);
+        } catch (e) {
+          clearInterval(keepAlive);
+          try { if (!res.writableEnded) res.end(); } catch (_) {}
+        }
+        return;
+      } else {
+        const data = await googleResp.json();
+        const anthropicResp = toAnthropicResponse(data, claudeModel);
+        res.status(200).json(anthropicResp);
+        logUsage(row.id, claudeModel, anthropicResp.usage.input_tokens, anthropicResp.usage.output_tokens);
+        return;
+      }
+    }
+
+    if (googleResp && !googleResp.ok) {
+      console.warn(`Google AI failed (${googleResp.status}) — falling through to nothingxd`);
+    }
+
+    // === Tier 1: nothingxd ===
     const proxyModel = mapModelForProxy(claudeModel);
     // Modify only the model field — avoid full re-stringify if model unchanged
     const fwdBody = proxyModel === claudeModel ? req.rawBody || JSON.stringify(body)
@@ -670,41 +877,34 @@ router.use(async (req, res) => {
         signal: controller.signal,
       });
     } catch (err) {
-      clearTimeout(timer);
-      return sendError(res, isStream, 502, err.name === 'AbortError' ? 'Proxy timeout' : err.message, claudeModel);
+      // Network/timeout on primary — fall through to gemini
+      console.warn(`nothingxd primary error (${err.name}) — falling through to gemini`);
+      upstream = null;
     }
     clearTimeout(timer);
 
-    if (!upstream.ok) {
-      const errText = await upstream.text();
-      const isCreditsOut = upstream.status === 402 ||
-        /credit|quota|balance|exhausted|billing|payment|limit reached/i.test(errText);
-      if (isCreditsOut) {
-        // Tier 2: nothingxd gemini-3.5-flash-lite
-        console.warn(`vyceai credits exhausted — trying nothingxd gemini-3.5-flash-lite`);
-        const nxBody = JSON.stringify({ ...body, model: 'gemini-3.5-flash-lite' });
-        const nxResp = await fetch('https://proxy.nothingxd.shop/v1/messages', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', 'x-api-key': 'sk-ag-kBhWq9PMyJ-1K_GM_REnaJJChlEhPXZ-', 'anthropic-version': '2023-06-01' },
-          body: nxBody,
-        }).catch(() => null);
-        if (nxResp && nxResp.ok) {
-          setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
-          const ct = nxResp.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
-          res.setHeader('content-type', ct);
-          if (isStream) { res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); }
-          res.status(200);
-          const { Readable } = require('stream');
-          Readable.fromWeb(nxResp.body).pipe(res);
-          return;
-        }
-        console.warn('nothingxd also failed — falling back to CodeCraft (OpenAI path)');
-        // fall through to OpenAI/CodeCraft path below
-      } else {
-        const cleanErr = errText.includes('<html') ? `Proxy error ${upstream.status}` : errText.slice(0, 300);
-        console.error(`Proxy ${upstream.status}:`, cleanErr);
-        return sendError(res, isStream, upstream.status, cleanErr, claudeModel);
+    if (!upstream || !upstream.ok) {
+      console.warn(`nothingxd Claude failed (${upstream?.status || 'network'}) — trying gemini-3.5-flash-lite`);
+      const nxHeaders = { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_PROXY_KEY, 'anthropic-version': '2023-06-01' };
+      const nxResp = await fetch(`${ANTHROPIC_PROXY_URL}/v1/messages`, {
+        method: 'POST',
+        headers: nxHeaders,
+        body: JSON.stringify({ ...body, model: 'gemini-3.5-flash-lite' }),
+        signal: AbortSignal.timeout(55000),
+      }).catch(() => null);
+
+      if (nxResp && nxResp.ok) {
+        setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
+        const ct = nxResp.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
+        res.setHeader('content-type', ct);
+        if (isStream) { res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); }
+        res.status(200);
+        const { Readable } = require('stream');
+        Readable.fromWeb(nxResp.body).pipe(res);
+        return;
       }
+      console.warn('nothingxd gemini also failed — falling back to CodeCraft (OpenAI path)');
+      // fall through to OpenAI/CodeCraft path below
     } else {
       setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
       const ct = upstream.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
