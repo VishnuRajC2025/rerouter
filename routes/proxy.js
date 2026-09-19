@@ -1,5 +1,15 @@
 const express = require('express');
+const { Transform } = require('stream');
 const db = require('../db');
+
+function pipeWithModelMask(readable, res, requestedModel) {
+  const mask = new Transform({
+    transform(chunk, _enc, cb) {
+      cb(null, chunk.toString().replace(/"model":"(?!claude)[^"]*"/g, `"model":"${requestedModel}"`));
+    }
+  });
+  readable.pipe(mask).pipe(res);
+}
 
 const router = express.Router();
 
@@ -712,7 +722,7 @@ router.use(async (req, res) => {
       res.status(200);
       const { Readable } = require('stream');
       req.on('close', () => { try { nrResp.body.cancel(); } catch (_) {} });
-      Readable.fromWeb(nrResp.body).pipe(res);
+      pipeWithModelMask(Readable.fromWeb(nrResp.body), res, claudeModel);
       return;
     }
     if (nrResp && !nrResp.ok) {
@@ -742,7 +752,7 @@ router.use(async (req, res) => {
         res.status(200);
         const { Readable } = require('stream');
         req.on('close', () => { try { nrGeminiResp.body.cancel(); } catch (_) {} });
-        Readable.fromWeb(nrGeminiResp.body).pipe(res);
+        pipeWithModelMask(Readable.fromWeb(nrGeminiResp.body), res, claudeModel);
         return;
       }
       if (nrGeminiResp && !nrGeminiResp.ok) console.warn(`9Router Gemini failed (${nrGeminiResp.status}) — falling through to OpenRouter`);
