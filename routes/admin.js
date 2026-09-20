@@ -120,6 +120,7 @@ router.post('/tokens/:id/disable', (req, res) => {
 
 // Delete token
 router.delete('/tokens/:id', (req, res) => {
+  db.prepare('DELETE FROM usage_log WHERE token_id = ?').run(req.params.id);
   const info = db.prepare('DELETE FROM tokens WHERE id = ?').run(req.params.id);
   if (info.changes === 0) return res.status(404).json({ error: 'Token not found' });
   res.json({ message: 'Token deleted' });
