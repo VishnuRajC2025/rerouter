@@ -669,7 +669,7 @@ router.use(async (req, res) => {
   // Lightweight logging — estimate body size without serializing the whole thing
   const msgCount = req.body?.messages?.length || 0;
   const toolCount = req.body?.tools?.length || 0;
-  console.log(`[${req.path}] model=${req.body?.model} msgs=${msgCount} tools=${toolCount}`);
+  console.log(`[${req.path}] token=${row.name} model=${req.body?.model} msgs=${msgCount} tools=${toolCount}`);
 
   const body = req.body;
 
