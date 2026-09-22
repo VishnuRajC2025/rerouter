@@ -757,7 +757,67 @@ router.use(async (req, res) => {
     }
     if (nrResp && !nrResp.ok) {
       if (row.tier === 'claude') {
-        console.warn(`9Router Claude failed (${nrResp.status}) — claude tier, no Gemini fallback`);
+        const ccModel = mapModel(claudeModel, FREE_BASE);
+        console.warn(`9Router Claude failed (${nrResp.status}) — claude tier, falling back to CodeCraft (${ccModel})`);
+        const ccBody = {
+          model: ccModel,
+          messages: toOpenAIMessages(body.system, msgs),
+          max_tokens: body.max_tokens || 8192,
+          stream: isStream,
+          ...(isStream && { stream_options: { include_usage: true } }),
+        };
+        if (body.temperature !== undefined) ccBody.temperature = body.temperature;
+        if (body.tools) { const t = toOpenAITools(body.tools); if (t) ccBody.tools = t; }
+        let ccResp = null;
+        try {
+          ccResp = await fetch(`${FREE_BASE}/chat/completions`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'authorization': `Bearer ${await getKey()}` },
+            body: JSON.stringify(ccBody),
+            signal: AbortSignal.timeout(55000),
+          });
+        } catch (e) {
+          console.warn(`CodeCraft error (${e.name}) — returning 503`);
+        }
+        if (ccResp && ccResp.ok) {
+          console.log(`  → CodeCraft OK (${ccModel})`);
+          setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
+          if (isStream) {
+            if (!res.headersSent) { res.setHeader('content-type','text/event-stream'); res.setHeader('cache-control','no-cache'); res.setHeader('connection','keep-alive'); res.status(200); }
+            const keepAlive = setInterval(() => { try { if (!res.writableEnded) res.write(': ping\n\n'); } catch (_) { clearInterval(keepAlive); } }, 5000);
+            const reader = ccResp.body.getReader(); const decoder = new TextDecoder(); const state = { claudeModel };
+            req.on('close', () => { try { reader.cancel(); } catch (_) {} });
+            let buf = '';
+            try {
+              while (true) {
+                const { done, value } = await reader.read(); if (done) break;
+                buf += decoder.decode(value, { stream: true });
+                const lines = buf.split('\n'); buf = lines.pop();
+                for (const line of lines) {
+                  if (!line.startsWith('data: ')) continue;
+                  const payload = line.slice(6).trim(); if (payload === '[DONE]') continue;
+                  let chunk; try { chunk = JSON.parse(payload); } catch (_) { continue; }
+                  for (const event of toAnthropicEvents(chunk, state)) { if (!res.writableEnded) res.write(event); }
+                }
+              }
+              clearInterval(keepAlive);
+              if (!state.done && !res.writableEnded) {
+                if (state.blockOpen) res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type:'content_block_stop', index:state.blockIndex })}\n\n`);
+                res.write(`event: message_delta\ndata: ${JSON.stringify({ type:'message_delta', delta:{stop_reason:'end_turn'}, usage:{output_tokens:state.outputTokens||0} })}\n\n`);
+                res.write(`event: message_stop\ndata: ${JSON.stringify({ type:'message_stop' })}\n\n`);
+              }
+              res.end(); logUsage(row.id, claudeModel, state.finalInputTokens||0, state.finalOutputTokens||0);
+            } catch (e) { clearInterval(keepAlive); try { if (!res.writableEnded) res.end(); } catch (_) {} }
+            return;
+          } else {
+            const data = await ccResp.json();
+            const anthropicResp = toAnthropicResponse(data, claudeModel);
+            res.status(200).json(anthropicResp);
+            logUsage(row.id, claudeModel, anthropicResp.usage.input_tokens, anthropicResp.usage.output_tokens);
+            return;
+          }
+        }
+        console.warn(`CodeCraft failed (${ccResp?.status}) — returning 503`);
         return res.status(503).json({ type: 'error', error: { type: 'overloaded_error', message: 'Claude model temporarily unavailable, please retry.' } });
       }
       const geminiModel = mapModelForNineRouterGemini(claudeModel);
