@@ -643,20 +643,26 @@ function sendError(res, isStream, statusCode, message, claudeModel) {
 
 // Models list — no auth required so gateway discovery works
 router.use((req, res, next) => {
+  const MODELS = [
+    { type: 'model', id: 'claude-opus-4-6',    display_name: 'Claude Opus 4.6',   created_at: '2025-01-01T00:00:00Z' },
+    { type: 'model', id: 'claude-opus-4-5',     display_name: 'Claude Opus 4.5',   created_at: '2025-01-01T00:00:00Z' },
+    { type: 'model', id: 'claude-sonnet-4-6',   display_name: 'Claude Sonnet 4.6', created_at: '2025-01-01T00:00:00Z' },
+    { type: 'model', id: 'claude-sonnet-4-5',   display_name: 'Claude Sonnet 4.5', created_at: '2025-01-01T00:00:00Z' },
+    { type: 'model', id: 'claude-haiku-4-5',    display_name: 'Claude Haiku 4.5',  created_at: '2025-01-01T00:00:00Z' },
+    { type: 'model', id: 'claude-fable-5-1',    display_name: 'Claude Fable 5.1',  created_at: '2025-01-01T00:00:00Z' },
+    { type: 'model', id: 'claude-opus-5',       display_name: 'Claude Opus 5',     created_at: '2025-01-01T00:00:00Z' },
+    { type: 'model', id: 'claude-sonnet-5',     display_name: 'Claude Sonnet 5',   created_at: '2025-01-01T00:00:00Z' },
+  ];
   if (req.path === '/models' || req.path === '/models/') {
-    return res.json({
-      data: [
-        { type: 'model', id: 'claude-opus-4-6',    display_name: 'Claude Opus 4.6',   created_at: '2025-01-01T00:00:00Z' },
-        { type: 'model', id: 'claude-opus-4-5',     display_name: 'Claude Opus 4.5',   created_at: '2025-01-01T00:00:00Z' },
-        { type: 'model', id: 'claude-sonnet-4-6',   display_name: 'Claude Sonnet 4.6', created_at: '2025-01-01T00:00:00Z' },
-        { type: 'model', id: 'claude-sonnet-4-5',   display_name: 'Claude Sonnet 4.5', created_at: '2025-01-01T00:00:00Z' },
-        { type: 'model', id: 'claude-haiku-4-5',    display_name: 'Claude Haiku 4.5',  created_at: '2025-01-01T00:00:00Z' },
-        { type: 'model', id: 'claude-fable-5-1',    display_name: 'Claude Fable 5.1',  created_at: '2025-01-01T00:00:00Z' },
-        { type: 'model', id: 'claude-opus-5',       display_name: 'Claude Opus 5',     created_at: '2025-01-01T00:00:00Z' },
-        { type: 'model', id: 'claude-sonnet-5',     display_name: 'Claude Sonnet 5',   created_at: '2025-01-01T00:00:00Z' },
-      ],
-      has_more: false,
-    });
+    return res.json({ data: MODELS, has_more: false });
+  }
+  // GET /models/:id — Claude Code validates a specific model before using it
+  const modelMatch = req.path.match(/^\/models\/(.+)$/);
+  if (modelMatch) {
+    const found = MODELS.find(m => m.id === modelMatch[1]);
+    if (found) return res.json(found);
+    // Unknown model — return it anyway so Claude Code doesn't block it
+    return res.json({ type: 'model', id: modelMatch[1], display_name: modelMatch[1], created_at: '2025-01-01T00:00:00Z' });
   }
   next();
 });
