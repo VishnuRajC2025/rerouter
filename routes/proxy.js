@@ -756,6 +756,10 @@ router.use(async (req, res) => {
       return;
     }
     if (nrResp && !nrResp.ok) {
+      if (row.tier === 'claude') {
+        console.warn(`9Router Claude failed (${nrResp.status}) — claude tier, no Gemini fallback`);
+        return res.status(503).json({ type: 'error', error: { type: 'overloaded_error', message: 'Claude model temporarily unavailable, please retry.' } });
+      }
       const geminiModel = mapModelForNineRouterGemini(claudeModel);
       console.warn(`9Router Claude failed (${nrResp.status}) — trying 9Router Gemini (${geminiModel})`);
       // === Tier 0b: 9Router Gemini (Claude limit hit — fallback within Antigravity) ===
