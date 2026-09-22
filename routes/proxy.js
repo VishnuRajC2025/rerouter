@@ -103,9 +103,8 @@ function mapModelForNineRouter(claudeModel) {
 // Map Claude model names → 9Router Antigravity Claude models (tier='claude' tokens)
 function mapModelForNineRouterClaude(claudeModel) {
   const m = (claudeModel || '').toLowerCase();
-  if (m.includes('haiku')) return 'ag/claude-haiku-4-5';
-  if (m.includes('opus')) return 'ag/claude-opus-4-5';
-  return 'ag/claude-sonnet-4-5'; // sonnet, fable, default → claude sonnet
+  if (m.includes('opus')) return 'ag/claude-opus-4-6-thinking';
+  return 'ag/claude-sonnet-4-6'; // haiku, sonnet, fable, default → sonnet
 }
 
 // Gemini fallback (same tier, retry on error)
