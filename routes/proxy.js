@@ -100,6 +100,14 @@ function mapModelForNineRouter(claudeModel) {
   return 'ag/gemini-3.8-flash-high'; // sonnet, fable, default → best gemini
 }
 
+// Map Claude model names → 9Router Antigravity Claude models (tier='claude' tokens)
+function mapModelForNineRouterClaude(claudeModel) {
+  const m = (claudeModel || '').toLowerCase();
+  if (m.includes('haiku')) return 'ag/claude-haiku-4-5';
+  if (m.includes('opus')) return 'ag/claude-opus-4-5';
+  return 'ag/claude-sonnet-4-5'; // sonnet, fable, default → claude sonnet
+}
+
 // Gemini fallback (same tier, retry on error)
 function mapModelForNineRouterGemini(claudeModel) {
   const m = (claudeModel || '').toLowerCase();
@@ -731,7 +739,9 @@ router.use(async (req, res) => {
   if (useAnthropicProxy) {
 
     // === Tier 0: 9Router/Antigravity (primary — Anthropic-native) ===
-    const nrModel = mapModelForNineRouter(claudeModel);
+    const nrModel = row.tier === 'claude'
+      ? mapModelForNineRouterClaude(claudeModel)
+      : mapModelForNineRouter(claudeModel);
     let nrResp = null;
     try {
       nrResp = await fetch(`${NINEROUTER_BASE}/v1/messages`, {

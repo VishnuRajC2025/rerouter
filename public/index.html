@@ -48,6 +48,8 @@
   .badge-active { background: #052e16; color: #4ade80; }
   .badge-disabled { background: #2a1010; color: #f87171; }
   .badge-expired { background: #1c1c00; color: #facc15; }
+  .badge-blue { background: #0c1a2e; color: #60a5fa; }
+  .badge-gray { background: #1a1a1a; color: #888; }
 
   .token-cell { font-family: monospace; font-size: 12px; color: #a78bfa; cursor: pointer; }
   .token-cell:hover { color: #c4b5fd; }
@@ -112,6 +114,13 @@
         <div class="field">
           <label>Request Limit / Window</label>
           <input type="number" id="cReqLimit" placeholder="optional" min="1">
+        </div>
+        <div class="field">
+          <label>Model Tier</label>
+          <select id="cTier" style="width:100%;padding:6px 8px;background:#1a1a1a;border:1px solid #333;color:#e5e5e5;border-radius:6px">
+            <option value="gemini">Gemini (default)</option>
+            <option value="claude">Claude (Antigravity)</option>
+          </select>
         </div>
       </div>
       <button class="btn btn-primary" onclick="createToken()">Create Token</button>
@@ -189,7 +198,7 @@ function renderTable(tokens) {
     <thead><tr>
       <th>Name</th><th>Token</th><th>Status</th>
       <th>Token Usage</th><th>Requests</th>
-      <th>Window</th><th>Expires</th><th>Actions</th>
+      <th>Window</th><th>Expires</th><th>Tier</th><th>Actions</th>
     </tr></thead>
     <tbody>${tokens.map(renderRow).join('')}</tbody>
   </table>`;
@@ -231,6 +240,7 @@ function renderRow(t) {
     <td>${reqUsageHtml}</td>
     <td style="color:#888">${window}</td>
     <td style="color:#888">${expires}</td>
+    <td><span class="badge ${t.tier === 'claude' ? 'badge-blue' : 'badge-gray'}">${t.tier === 'claude' ? 'Claude' : 'Gemini'}</span></td>
     <td>
       <div class="actions">
         <button class="btn btn-sm btn-download" onclick="downloadScript('${t.id}', '${esc(t.name)}')">Script</button>
@@ -250,6 +260,7 @@ async function createToken() {
   const tokenLimit = parseInt(document.getElementById('cTokenLimit').value) || null;
   const windowHours = parseInt(document.getElementById('cWindowHours').value) || null;
   const reqLimit = parseInt(document.getElementById('cReqLimit').value) || null;
+  const tier = document.getElementById('cTier').value;
 
   if (!name) { toast('Enter a customer name', 'err'); return; }
 
@@ -258,11 +269,13 @@ async function createToken() {
   if (tokenLimit) body.token_limit = tokenLimit;
   if (windowHours) body.reset_interval_hours = windowHours;
   if (reqLimit) body.request_limit = reqLimit;
+  body.tier = tier;
 
   const { ok, data } = await api('POST', '/admin/tokens', body);
   if (!ok) { toast(data.error || 'Failed to create token', 'err'); return; }
   toast(`Token created for ${name}`);
   ['cName','cDays','cTokenLimit','cWindowHours','cReqLimit'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('cTier').value = 'gemini';
   loadTokens();
 }
 

@@ -48,6 +48,9 @@ if (!cols.includes('last_reset_at')) {
 if (!cols.includes('backend')) {
   db.exec(`ALTER TABLE tokens ADD COLUMN backend TEXT DEFAULT NULL`);
 }
+if (!cols.includes('tier')) {
+  db.exec(`ALTER TABLE tokens ADD COLUMN tier TEXT NOT NULL DEFAULT 'gemini'`);
+}
 
 // Auto-seed tokens from env on startup
 // SEED_TOKEN / SEED_TOKEN_NAME — primary token (default backend)

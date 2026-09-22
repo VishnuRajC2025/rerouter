@@ -50,23 +50,25 @@ function formatToken(row) {
     window_seconds_left: windowSecondsLeft,
     requests_used: row.requests_used,
     created_at: row.created_at,
+    tier: row.tier || 'gemini',
   };
 }
 
 // Create token
 router.post('/tokens', (req, res) => {
-  const { name, expires_in_days, token_limit, reset_interval_hours } = req.body;
+  const { name, expires_in_days, token_limit, reset_interval_hours, tier } = req.body;
   if (!name) return res.status(400).json({ error: 'name is required' });
   if (!expires_in_days || expires_in_days < 1) return res.status(400).json({ error: 'expires_in_days is required' });
 
   const id = uuidv4();
   const token = generateToken();
   const expires_at = daysFromNow(expires_in_days);
+  const tokenTier = tier === 'claude' ? 'claude' : 'gemini';
 
   db.prepare(`
-    INSERT INTO tokens (id, name, token, token_limit, reset_interval_hours, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(id, name, token, token_limit ?? null, reset_interval_hours ?? 5, expires_at);
+    INSERT INTO tokens (id, name, token, token_limit, reset_interval_hours, expires_at, tier)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(id, name, token, token_limit ?? null, reset_interval_hours ?? 5, expires_at, tokenTier);
 
   const row = db.prepare('SELECT * FROM tokens WHERE id = ?').get(id);
   res.status(201).json(formatToken(row));
