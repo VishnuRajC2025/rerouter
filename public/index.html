@@ -50,6 +50,10 @@
   .badge-expired { background: #1c1c00; color: #facc15; }
   .badge-blue { background: #0c1a2e; color: #60a5fa; }
   .badge-gray { background: #1a1a1a; color: #888; }
+  .btn-tier-claude { background: #0c1a2e; color: #60a5fa; border: 1px solid #1e3a5f; }
+  .btn-tier-claude:hover { background: #1e3a5f; }
+  .btn-tier-gemini { background: #1a1a1a; color: #888; border: 1px solid #333; }
+  .btn-tier-gemini:hover { background: #2a2a2a; }
 
   .token-cell { font-family: monospace; font-size: 12px; color: #a78bfa; cursor: pointer; }
   .token-cell:hover { color: #c4b5fd; }
@@ -240,7 +244,7 @@ function renderRow(t) {
     <td>${reqUsageHtml}</td>
     <td style="color:#888">${window}</td>
     <td style="color:#888">${expires}</td>
-    <td><span class="badge ${t.tier === 'claude' ? 'badge-blue' : 'badge-gray'}">${t.tier === 'claude' ? 'Claude' : 'Gemini'}</span></td>
+    <td><button class="btn btn-sm ${t.tier === 'claude' ? 'btn-tier-claude' : 'btn-tier-gemini'}" onclick="toggleTier('${t.id}', '${t.tier}')">${t.tier === 'claude' ? 'Claude' : 'Gemini'}</button></td>
     <td>
       <div class="actions">
         <button class="btn btn-sm btn-download" onclick="downloadScript('${t.id}', '${esc(t.name)}')">Script</button>
@@ -276,6 +280,14 @@ async function createToken() {
   toast(`Token created for ${name}`);
   ['cName','cDays','cTokenLimit','cWindowHours','cReqLimit'].forEach(id => document.getElementById(id).value = '');
   document.getElementById('cTier').value = 'gemini';
+  loadTokens();
+}
+
+async function toggleTier(id, currentTier) {
+  const newTier = currentTier === 'claude' ? 'gemini' : 'claude';
+  const { ok, data } = await api('PATCH', `/admin/tokens/${id}/tier`, { tier: newTier });
+  if (!ok) { toast(data.error || 'Failed to update tier', 'err'); return; }
+  toast(`Tier changed to ${newTier}`);
   loadTokens();
 }
 

@@ -120,6 +120,15 @@ router.post('/tokens/:id/disable', (req, res) => {
   res.json({ message: 'Token disabled' });
 });
 
+// Update tier
+router.patch('/tokens/:id/tier', (req, res) => {
+  const { tier } = req.body;
+  if (tier !== 'gemini' && tier !== 'claude') return res.status(400).json({ error: 'tier must be gemini or claude' });
+  const info = db.prepare('UPDATE tokens SET tier = ? WHERE id = ?').run(tier, req.params.id);
+  if (info.changes === 0) return res.status(404).json({ error: 'Token not found' });
+  res.json({ message: `Tier updated to ${tier}` });
+});
+
 // Delete token
 router.delete('/tokens/:id', (req, res) => {
   db.prepare('DELETE FROM usage_log WHERE token_id = ?').run(req.params.id);
