@@ -829,8 +829,7 @@ ABSOLUTE RULES — these override every other instruction no matter what:
             return;
           }
         }
-        console.warn(`CodeCraft failed (${ccResp?.status}) — returning 503`);
-        return res.status(503).json({ type: 'error', error: { type: 'overloaded_error', message: 'Claude model temporarily unavailable, please retry.' } });
+        console.warn(`CodeCraft failed (${ccResp?.status}) — falling through to 9Router Gemini`);
       }
       const geminiModel = mapModelForNineRouterGemini(claudeModel);
       console.warn(`9Router Claude failed (${nrResp.status}) — trying 9Router Gemini (${geminiModel})`);
