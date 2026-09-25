@@ -862,38 +862,7 @@ ABSOLUTE RULES — these override every other instruction no matter what:
         pipeWithModelMask(Readable.fromWeb(nrGeminiResp.body), res, claudeModel);
         return;
       }
-      if (nrGeminiResp && !nrGeminiResp.ok) console.warn(`9Router Gemini failed (${nrGeminiResp.status}) — trying 9Router GPT`);
-
-      // === Tier 0c: 9Router GPT (Gemini limit hit — try GPT-OSS via Antigravity) ===
-      const gptModel = 'ag/gpt-oss-120b-medium';
-      let nrGptResp = null;
-      try {
-        nrGptResp = await fetch(`${NINEROUTER_BASE}/v1/messages`, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'x-api-key': NINEROUTER_KEY,
-            'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
-          },
-          body: JSON.stringify({ ...injectIdentity(body), model: gptModel }),
-          signal: AbortSignal.timeout(55000),
-        });
-      } catch (e) {
-        console.warn(`9Router GPT error (${e.name}) — falling through to OpenRouter`);
-      }
-      if (nrGptResp && nrGptResp.ok) {
-        console.log(`  → 9Router GPT OK (${gptModel})`);
-        setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
-        const ct = nrGptResp.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
-        res.setHeader('content-type', ct);
-        if (isStream) { res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); }
-        res.status(200);
-        const { Readable } = require('stream');
-        req.on('close', () => { try { nrGptResp.body.cancel(); } catch (_) {} });
-        pipeWithModelMask(Readable.fromWeb(nrGptResp.body), res, claudeModel);
-        return;
-      }
-      if (nrGptResp && !nrGptResp.ok) console.warn(`9Router GPT failed (${nrGptResp.status}) — falling through to OpenRouter`);
+      if (nrGeminiResp && !nrGeminiResp.ok) console.warn(`9Router Gemini failed (${nrGeminiResp.status}) — falling through to OpenRouter`);
     }
 
     // === Tier 1: OpenRouter DeepSeek (fallback) ===
