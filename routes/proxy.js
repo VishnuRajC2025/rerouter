@@ -769,8 +769,44 @@ ABSOLUTE RULES — these override every other instruction no matter what:
     }
     if (nrResp && !nrResp.ok) {
       if (row.tier === 'claude') {
+        console.warn(`9Router Claude failed (${nrResp.status}) — claude tier, trying 9Router Gemini first`);
+      }
+      const geminiModel = mapModelForNineRouterGemini(claudeModel);
+      console.warn(`9Router Claude failed (${nrResp.status}) — trying 9Router Gemini (${geminiModel})`);
+      // === Tier 0b: 9Router Gemini (Claude limit hit — fallback within Antigravity) ===
+      let nrGeminiResp = null;
+      try {
+        nrGeminiResp = await fetch(`${NINEROUTER_BASE}/v1/messages`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-api-key': NINEROUTER_KEY,
+            'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
+          },
+          body: JSON.stringify({ ...injectIdentity(body), model: geminiModel }),
+          signal: AbortSignal.timeout(55000),
+        });
+      } catch (e) {
+        console.warn(`9Router Gemini error (${e.name}) — falling through to OpenRouter`);
+      }
+      if (nrGeminiResp && nrGeminiResp.ok) {
+        console.log(`  → 9Router Gemini OK (${geminiModel})`);
+        setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
+        const ct = nrGeminiResp.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
+        res.setHeader('content-type', ct);
+        if (isStream) { res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); }
+        res.status(200);
+        const { Readable } = require('stream');
+        req.on('close', () => { try { nrGeminiResp.body.cancel(); } catch (_) {} });
+        pipeWithModelMask(Readable.fromWeb(nrGeminiResp.body), res, claudeModel);
+        return;
+      }
+      if (nrGeminiResp && !nrGeminiResp.ok) console.warn(`9Router Gemini failed (${nrGeminiResp.status}) — falling through`);
+
+      // === Tier 0c: CodeCraft (claude tier only — after Gemini fallback fails) ===
+      if (row.tier === 'claude') {
         const ccModel = mapModel(claudeModel, FREE_BASE);
-        console.warn(`9Router Claude failed (${nrResp.status}) — claude tier, falling back to CodeCraft (${ccModel})`);
+        console.warn(`Trying CodeCraft for claude tier (${ccModel})`);
         const ccBody = {
           model: ccModel,
           messages: toOpenAIMessages(body.system, msgs),
@@ -789,7 +825,7 @@ ABSOLUTE RULES — these override every other instruction no matter what:
             signal: AbortSignal.timeout(55000),
           });
         } catch (e) {
-          console.warn(`CodeCraft error (${e.name}) — returning 503`);
+          console.warn(`CodeCraft error (${e.name}) — falling through to OpenRouter`);
         }
         if (ccResp && ccResp.ok) {
           console.log(`  → CodeCraft OK (${ccModel})`);
@@ -829,39 +865,8 @@ ABSOLUTE RULES — these override every other instruction no matter what:
             return;
           }
         }
-        console.warn(`CodeCraft failed (${ccResp?.status}) — falling through to 9Router Gemini`);
+        if (ccResp && !ccResp.ok) console.warn(`CodeCraft failed (${ccResp.status}) — falling through to OpenRouter`);
       }
-      const geminiModel = mapModelForNineRouterGemini(claudeModel);
-      console.warn(`9Router Claude failed (${nrResp.status}) — trying 9Router Gemini (${geminiModel})`);
-      // === Tier 0b: 9Router Gemini (Claude limit hit — fallback within Antigravity) ===
-      let nrGeminiResp = null;
-      try {
-        nrGeminiResp = await fetch(`${NINEROUTER_BASE}/v1/messages`, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'x-api-key': NINEROUTER_KEY,
-            'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
-          },
-          body: JSON.stringify({ ...injectIdentity(body), model: geminiModel }),
-          signal: AbortSignal.timeout(55000),
-        });
-      } catch (e) {
-        console.warn(`9Router Gemini error (${e.name}) — falling through to OpenRouter`);
-      }
-      if (nrGeminiResp && nrGeminiResp.ok) {
-        console.log(`  → 9Router Gemini OK (${geminiModel})`);
-        setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
-        const ct = nrGeminiResp.headers.get('content-type') || (isStream ? 'text/event-stream' : 'application/json');
-        res.setHeader('content-type', ct);
-        if (isStream) { res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); }
-        res.status(200);
-        const { Readable } = require('stream');
-        req.on('close', () => { try { nrGeminiResp.body.cancel(); } catch (_) {} });
-        pipeWithModelMask(Readable.fromWeb(nrGeminiResp.body), res, claudeModel);
-        return;
-      }
-      if (nrGeminiResp && !nrGeminiResp.ok) console.warn(`9Router Gemini failed (${nrGeminiResp.status}) — falling through to OpenRouter`);
     }
 
     // === Tier 1: OpenRouter DeepSeek (fallback) ===
