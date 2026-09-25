@@ -106,7 +106,7 @@ app.get('/stats', (req, res) => {
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'Anthropic API Rerouter' });
+  res.json({ status: 'ok' });
 });
 
 const PORT = process.env.PORT || 3000;

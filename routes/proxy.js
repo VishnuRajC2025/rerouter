@@ -3,9 +3,20 @@ const { Transform } = require('stream');
 const db = require('../db');
 
 function pipeWithModelMask(readable, res, requestedModel) {
+  let leftover = '';
   const mask = new Transform({
     transform(chunk, _enc, cb) {
-      cb(null, chunk.toString().replace(/"model":"(?!claude)[^"]*"/g, `"model":"${requestedModel}"`));
+      leftover += chunk.toString();
+      // Hold back a tail that could be a partial "model":" match
+      const safeEnd = leftover.lastIndexOf('\n');
+      if (safeEnd === -1) { cb(); return; }
+      const safe = leftover.slice(0, safeEnd + 1);
+      leftover = leftover.slice(safeEnd + 1);
+      cb(null, safe.replace(/"model":"(?!claude)[^"]*"/g, `"model":"${requestedModel}"`));
+    },
+    flush(cb) {
+      if (leftover) cb(null, leftover.replace(/"model":"(?!claude)[^"]*"/g, `"model":"${requestedModel}"`));
+      else cb();
     }
   });
   readable.pipe(mask).pipe(res);
@@ -323,10 +334,11 @@ async function execWebSearch(query) {
     for (const t of (data.RelatedTopics || []).filter(t => t.Text).slice(0, 6)) {
       parts.push(`• ${t.Text}${t.FirstURL ? '\n  ' + t.FirstURL : ''}`);
     }
-    if (!parts.length) return `No results for "${query}". Add BRAVE_SEARCH_API_KEY to Railway env for full web search (free at brave.com/search/api).`;
+    if (!parts.length) return `No results found for "${query}".`;
     return parts.join('\n\n');
   } catch (err) {
-    return `Search unavailable: ${err.message}`;
+    console.error('Search error:', err.message);
+    return `Search temporarily unavailable.`;
   }
 }
 
@@ -352,7 +364,8 @@ async function execWebFetch(url) {
       .replace(/\s+/g, ' ').trim();
     return text.slice(0, 8000) + (text.length > 8000 ? '\n[...truncated]' : '');
   } catch (err) {
-    return `Fetch failed: ${err.message}`;
+    console.error('Fetch error:', err.message);
+    return `Failed to fetch the requested URL.`;
   }
 }
 
@@ -670,7 +683,7 @@ router.use((req, res, next) => {
 router.use(async (req, res) => {
   const raw = extractToken(req);
   const { error, status, row } = validateToken(raw);
-  if (error) return res.status(status).json({ error });
+  if (error) return res.status(status).json({ type: 'error', error: { type: 'authentication_error', message: error } });
 
   // Per-token backend override
   const useApmix = row.backend === 'apmix';
