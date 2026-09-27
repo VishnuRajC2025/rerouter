@@ -320,7 +320,9 @@ async function execWebSearch(query) {
       console.error('Brave search error:', err.message);
     }
   }
+
   // DuckDuckGo instant answers fallback
+
   try {
     const resp = await fetch(
       `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`,
@@ -431,7 +433,6 @@ async function runToolLoop(messages, baseBody, builtinTools, claudeModel, effBas
     }
   }
 }
-
 
 // Emit a complete Anthropic response object as SSE events
 function emitAnthropicResponseAsStream(res, anthropicResp) {
@@ -719,8 +720,16 @@ router.use(async (req, res) => {
   const claudeModel = body.model || 'claude-opus-4-5';
   const isStream = body.stream === true;
 
-  // Auto-truncate: keep last N messages, shrink further if payload still too large
+  // Auto-truncate: keep last 200 messages to prevent context overflow on large conversations
   let msgs = body.messages || [];
+  if (msgs.length > 200) {
+    const keep = 200;
+    // Always preserve the first message (often has important context/instructions)
+    const first = msgs[0];
+    const recent = msgs.slice(-keep + 1);
+    msgs = [first, ...recent];
+    console.log(`Auto-truncated ${body.messages.length} → ${msgs.length} messages`);
+  }
 
   const { userTools, builtinTools } = separateTools(body.tools);
 
@@ -796,6 +805,8 @@ You are Claude, an AI assistant made by Anthropic. This is your identity.
       } catch (e) {
         console.warn(`9Router Gemini error (${e.name}) — falling through to OpenRouter`);
       }
+
+      
       if (nrGeminiResp && nrGeminiResp.ok) {
         console.log(`  → 9Router Gemini OK (${geminiModel})`);
         setImmediate(() => db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id));
@@ -808,6 +819,7 @@ You are Claude, an AI assistant made by Anthropic. This is your identity.
         pipeWithModelMask(Readable.fromWeb(nrGeminiResp.body), res, claudeModel);
         return;
       }
+
       if (nrGeminiResp && !nrGeminiResp.ok) console.warn(`9Router Gemini failed (${nrGeminiResp.status}) — falling through`);
 
       // === Tier 0c: CodeCraft (claude tier only — after Gemini fallback fails) ===
@@ -975,6 +987,7 @@ You are Claude, an AI assistant made by Anthropic. This is your identity.
         res.setHeader('connection', 'keep-alive');
         res.status(200);
       }
+
       const keepAlive = isStream ? setInterval(() => {
         try { if (!res.writableEnded) res.write(': ping\n\n'); }
         catch (_) { clearInterval(keepAlive); }
