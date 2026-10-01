@@ -87,7 +87,7 @@ router.get('/tokens/:id/script', (req, res) => {
 
   const baseUrl = process.env.PUBLIC_URL || `http://localhost:${process.env.PORT || 3000}`;
 
-  const script = `@echo off
+const script = `@echo off
 if not exist "%USERPROFILE%\\.claude" mkdir "%USERPROFILE%\\.claude"
 (
 echo {
