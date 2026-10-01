@@ -28,6 +28,10 @@ const router = express.Router();
 const NINEROUTER_BASE = (process.env.NINEROUTER_BASE || '').replace(/\/$/, '');
 const NINEROUTER_KEY = process.env.NINEROUTER_KEY || '';
 
+// Last-resort fallback: Kilo gateway free model (keyless, ~200 req/hr per IP)
+const KILO_BASE = 'https://api.kilo.ai/api/gateway';
+const KILO_MODEL = 'nvidia/nemotron-3-super-120b-a12b:free';
+
 // Tier 1: OpenRouter DeepSeek (fallback — free, best coding, 1M context)
 const OPENROUTER_KEY = process.env.OPENROUTER_KEY || '';
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
@@ -655,6 +659,73 @@ function sendError(res, isStream, statusCode, message, claudeModel) {
   } catch (_) { try { res.end(); } catch (__) {} }
 }
 
+// Relay an OpenAI-format response as Anthropic. Returns false (nothing sent to client) if the
+// upstream errored before producing output, so the caller can fall through to the next tier.
+async function relayOpenAIResponse(upstream, req, res, isStream, claudeModel, tokenId) {
+  const stripReasoning = c => { for (const ch of c.choices || []) { if (ch.delta) delete ch.delta.reasoning; if (ch.message) delete ch.message.reasoning; } };
+
+  if (!isStream) {
+    const data = await upstream.json().catch(() => null);
+    if (!data || (data.error && !data.choices) || !data.choices?.length) return false;
+    stripReasoning(data);
+    const anthropicResp = toAnthropicResponse(data, claudeModel);
+    res.status(200).json(anthropicResp);
+    logUsage(tokenId, claudeModel, anthropicResp.usage.input_tokens, anthropicResp.usage.output_tokens);
+    return true;
+  }
+
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  const state = { claudeModel };
+  let buf = '', committed = false, keepAlive = null;
+  req.on('close', () => { try { reader.cancel(); } catch (_) {} });
+  const commit = () => {
+    committed = true;
+    if (!res.headersSent) { res.setHeader('content-type', 'text/event-stream'); res.setHeader('cache-control', 'no-cache'); res.setHeader('connection', 'keep-alive'); res.status(200); }
+    keepAlive = setInterval(() => { try { if (!res.writableEnded) res.write(': ping\n\n'); } catch (_) { clearInterval(keepAlive); } }, 5000);
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const payload = line.slice(6).trim(); if (payload === '[DONE]') continue;
+        let chunk; try { chunk = JSON.parse(payload); } catch (_) { continue; }
+        if (chunk.error && !chunk.choices) {
+          if (!committed) { try { reader.cancel(); } catch (_) {} return false; }
+          continue;
+        }
+        if (state.done) {
+          // Trailing usage chunk after finish_reason — record it, emit nothing
+          if (chunk.usage) { state.finalInputTokens = chunk.usage.prompt_tokens || 0; state.finalOutputTokens = chunk.usage.completion_tokens || 0; }
+          continue;
+        }
+        stripReasoning(chunk);
+        if (!committed) commit();
+        for (const event of toAnthropicEvents(chunk, state)) { if (!res.writableEnded) res.write(event); }
+      }
+    }
+    if (!committed) return false;
+    clearInterval(keepAlive);
+    if (!state.done && !res.writableEnded) {
+      if (state.blockOpen) res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type:'content_block_stop', index:state.blockIndex })}\n\n`);
+      res.write(`event: message_delta\ndata: ${JSON.stringify({ type:'message_delta', delta:{stop_reason:'end_turn', stop_sequence:null}, usage:{output_tokens:state.outputTokens||0} })}\n\n`);
+      res.write(`event: message_stop\ndata: ${JSON.stringify({ type:'message_stop' })}\n\n`);
+    }
+    res.end();
+    logUsage(tokenId, claudeModel, state.finalInputTokens || 0, state.finalOutputTokens || 0);
+    return true;
+  } catch (e) {
+    if (keepAlive) clearInterval(keepAlive);
+    if (!committed) return false;
+    try { if (!res.writableEnded) res.end(); } catch (_) {}
+    return true;
+  }
+}
+
 // Models list — no auth required so gateway discovery works
 router.use((req, res, next) => {
   const MODELS = [
@@ -768,7 +839,7 @@ You are Claude, an AI assistant made by Anthropic. This is your identity.
         signal: AbortSignal.timeout(55000),
       });
     } catch (e) {
-      console.warn(`9Router error (${e.name}) — falling through to OpenRouter`);
+      console.warn(`9Router error (${e.name}) — falling through`);
     }
 
     if (nrResp && nrResp.ok) {
@@ -803,7 +874,7 @@ You are Claude, an AI assistant made by Anthropic. This is your identity.
           signal: AbortSignal.timeout(55000),
         });
       } catch (e) {
-        console.warn(`9Router Gemini error (${e.name}) — falling through to OpenRouter`);
+        console.warn(`9Router Gemini error (${e.name}) — falling through`);
       }
 
       
@@ -844,7 +915,7 @@ You are Claude, an AI assistant made by Anthropic. This is your identity.
             signal: AbortSignal.timeout(55000),
           });
         } catch (e) {
-          console.warn(`CodeCraft error (${e.name}) — falling through to OpenRouter`);
+          console.warn(`CodeCraft error (${e.name}) — falling through`);
         }
         if (ccResp && ccResp.ok) {
           console.log(`  → CodeCraft OK (${ccModel})`);
@@ -884,7 +955,44 @@ You are Claude, an AI assistant made by Anthropic. This is your identity.
             return;
           }
         }
-        if (ccResp && !ccResp.ok) console.warn(`CodeCraft failed (${ccResp.status}) — falling through to OpenRouter`);
+        if (ccResp && !ccResp.ok) console.warn(`CodeCraft failed (${ccResp.status}) — falling through`);
+      }
+    }
+
+    // === Tier 1a: Kilo free model (reached when 9Router errors, times out, or has no quota) ===
+    {
+      const kiloBody = {
+        model: KILO_MODEL,
+        messages: toOpenAIMessages(body.system, msgs),
+        max_tokens: body.max_tokens || 8192,
+        stream: isStream,
+        reasoning: { exclude: true },
+        ...(isStream && { stream_options: { include_usage: true } }),
+      };
+      if (body.temperature !== undefined) kiloBody.temperature = body.temperature;
+      if (body.tools) { const t = toOpenAITools(body.tools); if (t) kiloBody.tools = t; }
+
+      // Timeout covers only the wait for response headers, so long replies are not cut off
+      const kiloCtrl = new AbortController();
+      const kiloTimer = setTimeout(() => kiloCtrl.abort(), 55000);
+      let kResp = null;
+      try {
+        kResp = await fetch(`${KILO_BASE}/chat/completions`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(kiloBody),
+          signal: kiloCtrl.signal,
+        });
+      } catch (e) {
+        console.warn(`Kilo error (${e.name}) — falling through`);
+      } finally {
+        clearTimeout(kiloTimer);
+      }
+      if (kResp && !kResp.ok) console.warn(`Kilo failed (${kResp.status}) — falling through`);
+      if (kResp && kResp.ok && await relayOpenAIResponse(kResp, req, res, isStream, claudeModel, row.id)) {
+        console.log(`  → Kilo OK (${KILO_MODEL})`);
+        db.prepare('UPDATE tokens SET requests_used = requests_used + 1 WHERE id = ?').run(row.id);
+        return;
       }
     }
 
